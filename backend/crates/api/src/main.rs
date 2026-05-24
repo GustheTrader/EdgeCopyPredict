@@ -1338,9 +1338,7 @@ async fn ack_alert(
     Ok(Json(serde_json::json!({ "acked": acked })))
 }
 
-async fn ack_all_alerts(
-    State(state): State<AppState>,
-) -> ApiResult<Json<serde_json::Value>> {
+async fn ack_all_alerts(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let count = AlertRepository::new(state.pool).ack_all().await?;
     Ok(Json(serde_json::json!({ "acked": count })))
 }
