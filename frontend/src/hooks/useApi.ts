@@ -409,3 +409,14 @@ export function useAckAlert() {
     onError: onErr("Failed to acknowledge alert"),
   });
 }
+
+export function useAckAllAlerts() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => fetchJson("/alerts/ack-all", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["alerts"] });
+    },
+    onError: onErr("Failed to acknowledge alerts"),
+  });
+}

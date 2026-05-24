@@ -271,7 +271,7 @@ impl MasterRepository {
 
     pub async fn list(&self) -> Result<Vec<MasterRecord>> {
         let rows = sqlx::query(
-            "select id, display_name, status, master_weight, wallet_address, config, created_at, updated_at from masters order by created_at desc"
+            "select id, display_name, status, master_weight, wallet_address, config, created_at, updated_at from masters where status <> 'deleted' order by created_at desc"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -280,7 +280,7 @@ impl MasterRepository {
 
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<MasterRecord>> {
         let row = sqlx::query(
-            "select id, display_name, status, master_weight, wallet_address, config, created_at, updated_at from masters where id = $1"
+            "select id, display_name, status, master_weight, wallet_address, config, created_at, updated_at from masters where id = $1 and status <> 'deleted'"
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -347,7 +347,7 @@ impl FollowerRepository {
 
     pub async fn list(&self) -> Result<Vec<FollowerRecord>> {
         let rows = sqlx::query(
-            "select id, display_name, status, base_currency, wallet_address, platform, risk_config, created_at, updated_at from followers order by created_at desc"
+            "select id, display_name, status, base_currency, wallet_address, platform, risk_config, created_at, updated_at from followers where status <> 'deleted' order by created_at desc"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -356,7 +356,7 @@ impl FollowerRepository {
 
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<FollowerRecord>> {
         let row = sqlx::query(
-            "select id, display_name, status, base_currency, wallet_address, platform, risk_config, created_at, updated_at from followers where id = $1"
+            "select id, display_name, status, base_currency, wallet_address, platform, risk_config, created_at, updated_at from followers where id = $1 and status <> 'deleted'"
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -861,6 +861,15 @@ impl AlertRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn ack_all(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "update alerts set status = 'acknowledged', acknowledged_at = now() where status = 'open'"
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn count_open(&self) -> Result<i64> {

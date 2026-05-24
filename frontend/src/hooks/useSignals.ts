@@ -24,7 +24,8 @@ export function useSignals() {
   const [signals, setSignals] = useState<SignalDto[]>([]);
 
   useEffect(() => {
-    const source = new EventSource("/sse/activity");
+    const sseBase = import.meta.env.VITE_SSE_BASE_URL ?? "";
+    const source = new EventSource(`${sseBase}/sse/activity`);
     source.onmessage = (event) => {
       try {
         const signal: SignalDto = JSON.parse(event.data);

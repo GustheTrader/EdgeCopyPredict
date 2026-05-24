@@ -496,6 +496,7 @@ fn router(state: AppState) -> Router {
             patch(update_follower_risk_config),
         )
         .route("/api/v1/alerts/:id/ack", post(ack_alert))
+        .route("/api/v1/alerts/ack-all", post(ack_all_alerts))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -508,14 +509,17 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/system/status", get(system_status))
         .route("/api/v1/masters", get(list_masters))
         .route("/api/v1/masters", post(create_master))
-        .route("/api/v1/masters/:id", get(get_master))
+        .route("/api/v1/masters/:id", get(get_master).delete(delete_master))
         .route(
             "/api/v1/masters/:id/wallet-address",
             patch(update_master_wallet_address),
         )
         .route("/api/v1/followers", get(list_followers))
         .route("/api/v1/followers", post(create_follower))
-        .route("/api/v1/followers/:id", get(get_follower))
+        .route(
+            "/api/v1/followers/:id",
+            get(get_follower).delete(delete_follower),
+        )
         .route(
             "/api/v1/followers/:id/wallet-address",
             patch(update_follower_wallet_address),
@@ -672,6 +676,17 @@ async fn update_master_wallet_address(
     }
 }
 
+async fn delete_master(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
+    let repo = MasterRepository::new(state.pool);
+    match repo.get_by_id(id).await? {
+        Some(_) => {
+            repo.update_status(id, "deleted").await?;
+            Ok(Json(serde_json::json!({ "deleted": true })).into_response())
+        }
+        _ => Ok(not_found()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — followers
 // ---------------------------------------------------------------------------
@@ -778,6 +793,20 @@ async fn update_follower_platform(
     match repo.get_by_id(id).await? {
         Some(r) => Ok(Json(follower_to_dto(r)).into_response()),
         None => Ok(not_found()),
+    }
+}
+
+async fn delete_follower(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let repo = FollowerRepository::new(state.pool);
+    match repo.get_by_id(id).await? {
+        Some(_) => {
+            repo.update_status(id, "deleted").await?;
+            Ok(Json(serde_json::json!({ "deleted": true })).into_response())
+        }
+        _ => Ok(not_found()),
     }
 }
 
@@ -1307,6 +1336,13 @@ async fn ack_alert(
 ) -> ApiResult<Json<serde_json::Value>> {
     let acked = AlertRepository::new(state.pool).ack(id).await?;
     Ok(Json(serde_json::json!({ "acked": acked })))
+}
+
+async fn ack_all_alerts(
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let count = AlertRepository::new(state.pool).ack_all().await?;
+    Ok(Json(serde_json::json!({ "acked": count })))
 }
 
 async fn toggle_system(State(state): State<AppState>) -> ApiResult<Json<SystemStatusDto>> {

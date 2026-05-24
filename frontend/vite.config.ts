@@ -35,6 +35,19 @@ export default defineConfig(({ mode }) => {
         "/sse": {
           target: apiBase,
           changeOrigin: true,
+          // SSE requires streaming — disable http-proxy's response buffering
+          configure: (proxy) => {
+            proxy.on("proxyRes", (proxyRes) => {
+              proxyRes.headers["cache-control"] = "no-cache";
+              proxyRes.headers["x-accel-buffering"] = "no";
+            });
+            proxy.on("error", (_err, _req, res: any) => {
+              if (res && !res.headersSent) {
+                res.writeHead(502);
+                res.end();
+              }
+            });
+          },
         },
       },
     },

@@ -1,10 +1,15 @@
 import { useState, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useAlerts, useAckAlert } from "@/hooks/useApi";
+import { useAlerts, useAckAlert, useAckAllAlerts } from "@/hooks/useApi";
 
 export function AlertsPage() {
   const qc = useQueryClient();
-  useEffect(() => { qc.invalidateQueries({ queryKey: ["alerts"] }); }, []);
+  const ackAll = useAckAllAlerts();
+
+  useEffect(() => {
+    qc.invalidateQueries({ queryKey: ["alerts"] });
+    ackAll.mutate();
+  }, []);
 
   const { data: alerts } = useAlerts();
   const ack = useAckAlert();
