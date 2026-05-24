@@ -1,0 +1,16 @@
+[package]
+name = "arbitek-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arbitek-domain = { path = "../domain" }
+arbitek-platform-kalshi = { path = "../platform-kalshi" }
+arbitek-platform-polymarket = { path = "../platform-polymarket" }
+rust_decimal.workspace = true
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true

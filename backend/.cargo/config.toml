@@ -1,0 +1,9 @@
+[profile.dev]
+# Skip slow dsymutil step — biggest compile time win on macOS
+split-debuginfo = "unpacked"
+# More parallel codegen units
+codegen-units = 256
+# Reuse codegen between builds
+incremental = true
+# No optimisation in dev
+opt-level = 0

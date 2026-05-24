@@ -1,0 +1,212 @@
+services:
+  # ── Local infra (only needed when NOT using Supabase + external Redis) ────────
+  # Start with: docker compose --profile local up
+  # Skip with:  docker compose up   (uses DATABASE_URL / REDIS_URL from .env)
+  db:
+    profiles: [local]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: arbitek
+      POSTGRES_PASSWORD: arbitek
+      POSTGRES_DB: arbitek
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d/migrations
+      - ./backend/seeds:/docker-entrypoint-initdb.d/seeds
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbitek -d arbitek"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    profiles: [local]
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Application services ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      BIND_ADDR: 0.0.0.0:8080
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+      AUTH__JWT_SECRET: ${AUTH__JWT_SECRET:-change-me-in-production}
+      AUTH__ADMIN_PASSWORD: ${AUTH__ADMIN_PASSWORD:-secret}
+      AUTH__TOKEN_EXPIRY_HOURS: 24
+      LIVE_TRADING_ENABLED: ${LIVE_TRADING_ENABLED:-false}
+      COPY_WALLETS: ${COPY_WALLETS:-}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+      - redis
+
+  worker-ingest-poly:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: ingest-polymarket
+      WORKER__POLYMARKET_POLL_INTERVAL_SECONDS: 30
+      LOG_LEVEL: info
+      COPY_WALLETS: ${COPY_WALLETS:-}
+      POLYMARKET__DATA_API_BASE_URL: ${POLYMARKET__DATA_API_BASE_URL:-https://data-api.polymarket.com}
+      POLYMARKET__CLOB_API_BASE_URL: ${POLYMARKET__CLOB_API_BASE_URL:-https://clob.polymarket.com}
+    depends_on:
+      - db
+      - redis
+
+  worker-ingest-kalshi:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: ingest-kalshi
+      WORKER__KALSHI_POLL_INTERVAL_SECONDS: 30
+      LOG_LEVEL: info
+      KALSHI__API_KEY: ${KAL_API_KEY:-}
+      KALSHI__API_SECRET: ${KAL_API_SECRET:-}
+      KALSHI__REST_API_BASE_URL: ${KAL_API_BASE:-https://external-api.kalshi.com/trade-api/v2}
+      KALSHI__REST_API_BASE_URL_LIVE: ${KAL_API_BASE_PRODUCTION:-https://trading.kalshi.com/trade-api/v2}
+    depends_on:
+      - db
+      - redis
+
+  worker-signal:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: signal-normalize
+      LOG_LEVEL: info
+    depends_on:
+      - db
+      - redis
+
+  worker-risk:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: risk-evaluate
+      LOG_LEVEL: info
+    depends_on:
+      - db
+      - redis
+
+  worker-reconcile:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: reconcile
+      WORKER__POLYMARKET_POLL_INTERVAL_SECONDS: 30
+      WORKER__KALSHI_POLL_INTERVAL_SECONDS: 30
+      LOG_LEVEL: info
+      KALSHI__API_KEY: ${KAL_API_KEY:-}
+      KALSHI__API_SECRET: ${KAL_API_SECRET:-}
+      KALSHI__REST_API_BASE_URL: ${KAL_API_BASE:-https://external-api.kalshi.com/trade-api/v2}
+      KALSHI__REST_API_BASE_URL_LIVE: ${KAL_API_BASE_PRODUCTION:-https://trading.kalshi.com/trade-api/v2}
+      POLYMARKET__PRIVATE_KEY: ${POLY_PRIVATE_KEY:-}
+    depends_on:
+      - db
+      - redis
+
+  worker-execution:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: execution-live
+      WORKER__EXECUTION_BATCH_SIZE: 10
+      WORKER__POLYMARKET_POLL_INTERVAL_SECONDS: 10
+      WORKER__KALSHI_POLL_INTERVAL_SECONDS: 10
+      LOG_LEVEL: info
+      KALSHI__API_KEY: ${KAL_API_KEY:-}
+      KALSHI__API_SECRET: ${KAL_API_SECRET:-}
+      KALSHI__REST_API_BASE_URL: ${KAL_API_BASE:-https://external-api.kalshi.com/trade-api/v2}
+      KALSHI__REST_API_BASE_URL_LIVE: ${KAL_API_BASE_PRODUCTION:-https://trading.kalshi.com/trade-api/v2}
+      POLYMARKET__PRIVATE_KEY: ${POLY_PRIVATE_KEY:-}
+    depends_on:
+      - db
+      - redis
+
+  worker-paper-execution:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: paper-execution
+      WORKER__POLYMARKET_POLL_INTERVAL_SECONDS: 10
+      WORKER__EXECUTION_BATCH_SIZE: 10
+      LOG_LEVEL: info
+    depends_on:
+      - db
+      - redis
+
+  worker-pnl-refresh:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["arbitek-worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arbitek:arbitek@db:5432/arbitek}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      WORKER__MODE: pnl-refresh
+      WORKER__POLYMARKET_POLL_INTERVAL_SECONDS: 60
+      LOG_LEVEL: info
+      KALSHI__API_KEY: ${KAL_API_KEY:-}
+      KALSHI__API_SECRET: ${KAL_API_SECRET:-}
+      KALSHI__REST_API_BASE_URL: ${KAL_API_BASE:-https://external-api.kalshi.com/trade-api/v2}
+      KALSHI__REST_API_BASE_URL_LIVE: ${KAL_API_BASE_PRODUCTION:-https://trading.kalshi.com/trade-api/v2}
+      POLYMARKET__DATA_API_BASE_URL: ${POLYMARKET__DATA_API_BASE_URL:-https://data-api.polymarket.com}
+      POLYMARKET__CLOB_API_BASE_URL: ${POLYMARKET__CLOB_API_BASE_URL:-https://clob.polymarket.com}
+    depends_on:
+      - db
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
