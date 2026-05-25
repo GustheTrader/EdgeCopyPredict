@@ -18,6 +18,7 @@ arbitek-execution = { path = "../execution" }
 arbitek-platform-kalshi = { path = "../platform-kalshi" }
 arbitek-platform-polymarket = { path = "../platform-polymarket" }
 arbitek-queue = { path = "../queue" }
+hex.workspace = true
 secrecy.workspace = true
 time.workspace = true
 tokio.workspace = true

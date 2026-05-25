@@ -133,12 +133,20 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
             )
             .await;
 
-        // Stable market UUID for position tracking
+        // Stable market UUID for position tracking.
+        // For Polymarket condition_ids (0x + 64 hex chars), the first 16 bytes of the
+        // condition_id are used directly as the UUID — this makes pnl-refresh's
+        // LIKE-pattern lookup (market_uuid_hex% matches condition_id) work correctly.
         let market_id = intent.market_id.unwrap_or_else(|| {
-            Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                intent.signal_platform_market_id.as_bytes(),
-            )
+            let mid = &intent.signal_platform_market_id;
+            if mid.starts_with("0x") && mid.len() >= 34 {
+                if let Ok(bytes) = hex::decode(&mid[2..34]) {
+                    if let Ok(arr) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                        return Uuid::from_bytes(arr);
+                    }
+                }
+            }
+            Uuid::new_v5(&Uuid::NAMESPACE_URL, mid.as_bytes())
         });
         let contracts_delta = if is_buy { contracts } else { -contracts };
 
