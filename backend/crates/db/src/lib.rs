@@ -15,35 +15,51 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
     connect_pool(database_url, 2).await
 }
 
-/// API pool — larger than worker pools to handle concurrent HTTP requests + 3 SSE background tasks.
 pub async fn connect_api(database_url: &str) -> Result<PgPool> {
     connect_pool(database_url, 5).await
 }
 
-/// Single-connection pool for most worker processes — keeps total connections under Supabase's limit.
+/// Single-connection pool per worker — prevents concurrent prepared statement name
+/// conflicts (two connections with the same per-connection counter both create
+/// "sqlx_s_0" simultaneously and one fails with "already exists").
 pub async fn connect_worker(database_url: &str) -> Result<PgPool> {
     connect_pool(database_url, 1).await
 }
 
-/// Execution worker pool — kept alive for the process lifetime to avoid connection churn.
 pub async fn connect_execution_worker(database_url: &str) -> Result<PgPool> {
     connect_pool(database_url, 1).await
 }
 
 async fn connect_pool(database_url: &str, max_connections: u32) -> Result<PgPool> {
-    // Strip query params so PgConnectOptions can parse the base URL cleanly,
-    // then disable the statement cache entirely.  pgBouncer (Supabase session pooler)
-    // cannot handle named prepared statements — cache=0 forces simple protocol.
     let base_url = database_url.split('?').next().unwrap_or(database_url);
     let opts = PgConnectOptions::from_str(base_url)?.statement_cache_capacity(0);
 
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
-        .min_connections(0)
-        .idle_timeout(std::time::Duration::from_secs(20))
-        .connect_with(opts)
-        .await?;
-    Ok(pool)
+    // Retry up to 12 times (60s total) — Supabase session-mode pooler caps at 15
+    // connections; stale connections from recently-killed processes hold slots
+    // until TCP keepalives time them out.
+    let mut last_err = anyhow::anyhow!("no connection attempts made");
+    for attempt in 1u32..=12 {
+        match PgPoolOptions::new()
+            .max_connections(max_connections)
+            .min_connections(0)
+            .idle_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts.clone())
+            .await
+        {
+            Ok(pool) => return Ok(pool),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("EMAXCONNSESSION") || msg.contains("max clients") {
+                    eprintln!("[db] pool full ({attempt}/12), retrying in 5s…");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    last_err = e.into();
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
@@ -1362,10 +1378,19 @@ impl RawEventRepository {
     ) -> Result<Option<String>> {
         let prefix = market_id.as_simple().to_string(); // 32 hex chars, no dashes
         let pattern = format!("0x{}%", prefix);
+        // The serialised PolymarketDataApiTrade stores condition_id at the top level
+        // (snake_case field name from serde).  The nested `raw` field mirrors the
+        // original API payload which uses camelCase conditionId — check both.
         let row: Option<String> = sqlx::query_scalar(
-            r#"SELECT raw_payload->>'conditionId'
+            r#"SELECT coalesce(
+                   raw_payload->>'condition_id',
+                   raw_payload->'raw'->>'conditionId'
+               )
                FROM raw_events
-               WHERE lower(raw_payload->>'conditionId') LIKE lower($1)
+               WHERE lower(coalesce(
+                   raw_payload->>'condition_id',
+                   raw_payload->'raw'->>'conditionId'
+               )) LIKE lower($1)
                LIMIT 1"#,
         )
         .bind(pattern)

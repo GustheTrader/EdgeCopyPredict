@@ -67,8 +67,15 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             let poly_condition_id: Option<String> = if let Some(m) = mappings.get(&pos.market_id) {
                 Some(m.polymarket_condition_id.clone())
             } else if pos.platform == "polymarket" {
-                match raw_repo.find_condition_id_by_market_uuid(pos.market_id).await {
-                    Ok(cid) => cid,
+                match raw_repo
+                    .find_condition_id_by_market_uuid(pos.market_id)
+                    .await
+                {
+                    Ok(Some(cid)) => Some(cid),
+                    Ok(None) => {
+                        warn!(market_id = %pos.market_id, outcome = %pos.outcome, "no condition_id in raw_events for this market — skipping pnl refresh");
+                        None
+                    }
                     Err(e) => {
                         warn!(position_id = %pos.id, error = %e, "failed to look up condition_id");
                         None
@@ -102,7 +109,10 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
                         Some(c) => c.to_owned(),
                         None => continue,
                     };
-                    match poly_data_client.get_market_by_condition(&condition_id).await {
+                    match poly_data_client
+                        .get_market_by_condition(&condition_id)
+                        .await
+                    {
                         Ok(Some(market_info)) => {
                             let token_id = extract_token_id(&market_info, &pos.outcome);
                             match token_id {
