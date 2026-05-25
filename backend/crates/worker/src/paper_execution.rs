@@ -147,7 +147,7 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
                 intent.follower_account_id,
                 &intent.platform,
                 market_id,
-                None,
+                intent.market_title.as_deref(),
                 None,
                 &intent.outcome,
                 contracts_delta,
@@ -216,6 +216,7 @@ mod tests {
             action: action.to_owned(),
             target_contracts: Decimal::new(5, 0),
             price_limit: Decimal::new(price_f, price_scale),
+            market_title: None,
         }
     }
 

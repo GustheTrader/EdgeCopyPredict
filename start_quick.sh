@@ -58,7 +58,7 @@ PIDS+=($!)
 sleep 4
 
 echo "[START] Workers..."
-for mode in oddpool-copy ingest-kalshi signal-normalize risk-evaluate execution-live reconcile; do
+for mode in ingest-polymarket signal-normalize risk-evaluate paper-execution pnl-refresh reconcile; do
   WORKER__MODE="$mode" "$BIN/arbitek-worker" &
   PIDS+=($!)
 done

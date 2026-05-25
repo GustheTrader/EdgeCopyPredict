@@ -5,7 +5,7 @@ use serde_json::Value;
 pub use sqlx::PgPool as DbPool;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
-    PgPool, Row,
+    Executor, PgPool, Row,
 };
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -16,7 +16,7 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
 }
 
 pub async fn connect_api(database_url: &str) -> Result<PgPool> {
-    connect_pool(database_url, 5).await
+    connect_pool(database_url, 2).await
 }
 
 /// Single-connection pool per worker — prevents concurrent prepared statement name
@@ -43,6 +43,12 @@ async fn connect_pool(database_url: &str, max_connections: u32) -> Result<PgPool
             .max_connections(max_connections)
             .min_connections(0)
             .idle_timeout(std::time::Duration::from_secs(30))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("DEALLOCATE ALL").await?;
+                    Ok(())
+                })
+            })
             .connect_with(opts.clone())
             .await
         {
@@ -779,7 +785,8 @@ impl PositionRepository {
 
         if updated.rows_affected() == 0 {
             // First trade on this position — realized P&L starts at zero minus any entry fee.
-            // avg_price only set for buys; sell-first is an edge case we treat as zero basis.
+            // avg_price = execution price for both buys (cost basis) and sell-first (short basis),
+            // so pnl-refresh can compute unrealized_pnl = contracts * (current - avg_price) correctly.
             let is_buy = contracts_delta > Decimal::ZERO;
             sqlx::query(
                 r#"INSERT INTO positions (
@@ -796,7 +803,7 @@ impl PositionRepository {
             .bind(market_status)
             .bind(outcome)
             .bind(contracts_delta)
-            .bind(if is_buy { price } else { Decimal::ZERO })
+            .bind(price)
             .bind(-fee)
             .bind(Decimal::ZERO)
             .bind(if is_buy {
@@ -818,6 +825,7 @@ impl PositionRepository {
                 updated_at = NOW()
             WHERE id = $2"#,
         )
+        .persistent(false)
         .bind(current_price)
         .bind(id)
         .execute(&self.pool)
@@ -832,6 +840,7 @@ impl PositionRepository {
                       realized_pnl, unrealized_pnl, exposure, updated_at
                FROM positions WHERE contracts <> 0 ORDER BY updated_at DESC LIMIT $1"#,
         )
+        .persistent(false)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1091,6 +1100,7 @@ pub struct CopyIntentForExecution {
     pub action: String,
     pub target_contracts: Decimal,
     pub price_limit: Decimal,
+    pub market_title: Option<String>,
 }
 
 pub struct CopyIntentRepository {
@@ -1109,11 +1119,13 @@ impl CopyIntentRepository {
         // Exclude the paper follower — paper intents are handled by the paper-execution worker.
         let paper_follower = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let rows = sqlx::query(
-            r#"SELECT id, follower_account_id, platform, signal_platform_market_id,
-                      market_id, outcome, action, target_contracts, price_limit
-               FROM copy_intents
-               WHERE status = 'approved' AND follower_account_id != $1
-               ORDER BY created_at ASC
+            r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
+                      ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      s.market_title
+               FROM copy_intents ci
+               LEFT JOIN signals s ON s.id = ci.signal_id
+               WHERE ci.status = 'approved' AND ci.follower_account_id != $1
+               ORDER BY ci.created_at ASC
                LIMIT $2"#,
         )
         .bind(paper_follower)
@@ -1130,11 +1142,13 @@ impl CopyIntentRepository {
         limit: i64,
     ) -> Result<Vec<CopyIntentForExecution>> {
         let rows = sqlx::query(
-            r#"SELECT id, follower_account_id, platform, signal_platform_market_id,
-                      market_id, outcome, action, target_contracts, price_limit
-               FROM copy_intents
-               WHERE status = 'approved' AND follower_account_id = $1
-               ORDER BY created_at ASC
+            r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
+                      ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      s.market_title
+               FROM copy_intents ci
+               LEFT JOIN signals s ON s.id = ci.signal_id
+               WHERE ci.status = 'approved' AND ci.follower_account_id = $1
+               ORDER BY ci.created_at ASC
                LIMIT $2"#,
         )
         .bind(follower_id)
@@ -1150,11 +1164,13 @@ impl CopyIntentRepository {
         limit: i64,
     ) -> Result<Vec<CopyIntentForExecution>> {
         let rows = sqlx::query(
-            r#"SELECT id, follower_account_id, platform, signal_platform_market_id,
-                      market_id, outcome, action, target_contracts, price_limit
-               FROM copy_intents
-               WHERE status = 'pending'
-               ORDER BY created_at ASC
+            r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
+                      ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      s.market_title
+               FROM copy_intents ci
+               LEFT JOIN signals s ON s.id = ci.signal_id
+               WHERE ci.status = 'pending'
+               ORDER BY ci.created_at ASC
                LIMIT $1"#,
         )
         .bind(limit)
@@ -1219,6 +1235,7 @@ fn copy_intent_from_row(r: sqlx::postgres::PgRow) -> CopyIntentForExecution {
         action: r.try_get("action").unwrap_or_default(),
         target_contracts: r.try_get("target_contracts").unwrap_or_default(),
         price_limit: r.try_get("price_limit").unwrap_or_default(),
+        market_title: r.try_get("market_title").ok().flatten(),
     }
 }
 
@@ -1393,6 +1410,7 @@ impl RawEventRepository {
                )) LIKE lower($1)
                LIMIT 1"#,
         )
+        .persistent(false)
         .bind(pattern)
         .fetch_optional(&self.pool)
         .await?;
@@ -1490,6 +1508,7 @@ impl MarketMappingRepository {
                 sqlx::query(
                     "select id, polymarket_condition_id, polymarket_slug, kalshi_ticker, kalshi_event_ticker, confidence, enabled, created_at from market_mappings where enabled = true order by created_at desc"
                 )
+                .persistent(false)
                 .fetch_all(&self.pool)
                 .await?
             }
@@ -1497,6 +1516,7 @@ impl MarketMappingRepository {
                 sqlx::query(
                     "select id, polymarket_condition_id, polymarket_slug, kalshi_ticker, kalshi_event_ticker, confidence, enabled, created_at from market_mappings where enabled = false order by created_at desc"
                 )
+                .persistent(false)
                 .fetch_all(&self.pool)
                 .await?
             }
@@ -1504,6 +1524,7 @@ impl MarketMappingRepository {
                 sqlx::query(
                     "select id, polymarket_condition_id, polymarket_slug, kalshi_ticker, kalshi_event_ticker, confidence, enabled, created_at from market_mappings order by created_at desc"
                 )
+                .persistent(false)
                 .fetch_all(&self.pool)
                 .await?
             }

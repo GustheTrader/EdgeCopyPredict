@@ -339,6 +339,7 @@ mod tests {
             action: "buy".to_owned(),
             target_contracts: Decimal::new(5, 0),
             price_limit: Decimal::new(60, 2),
+            market_title: None,
         };
         // The only guaranteed-safe check without a DB: the intent id is preserved.
         assert_eq!(intent.id, intent_id, "copy_intent_id must equal intent.id");
@@ -358,6 +359,7 @@ mod tests {
             action: "buy".to_owned(),
             target_contracts: Decimal::new(5, 0),
             price_limit: Decimal::new(60, 2),
+            market_title: None,
         };
         assert_ne!(
             intent.follower_account_id,
@@ -379,6 +381,7 @@ mod tests {
             action: "buy".to_owned(),
             target_contracts: Decimal::new(5, 0),
             price_limit: Decimal::new(60, 2),
+            market_title: None,
         };
         assert!(!intent.platform.is_empty(), "platform must not be empty");
         assert!(!intent.outcome.is_empty(), "outcome must not be empty");
@@ -456,6 +459,7 @@ mod tests {
             action: "buy".to_owned(),
             target_contracts: Decimal::new(5, 0),
             price_limit: Decimal::new(60, 2),
+            market_title: None,
         };
 
         let input = live_input_from_intent(&intent);
