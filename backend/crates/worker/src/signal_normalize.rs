@@ -166,7 +166,7 @@ async fn normalize_polymarket_event(
 
     let side = trade.side.as_deref().unwrap_or("UNKNOWN").to_uppercase();
 
-    let outcome = trade.outcome.as_deref().unwrap_or("UNKNOWN").to_owned();
+    let outcome = trade.outcome.as_deref().unwrap_or("unknown").to_lowercase();
 
     // Look up market mapping (optional — signals are created even without a mapping)
     let mapping = mapper

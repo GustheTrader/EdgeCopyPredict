@@ -43,6 +43,7 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
     let kalshi_exec = settings.get_bool("kalshi_execution_enabled", false).await?;
 
     let copy_repo = CopyIntentRepository::new(pool.clone());
+    let order_repo = OrderRepository::new(pool.clone());
     let intents = copy_repo
         .list_approved_for_execution(config.worker.execution_batch_size)
         .await?;
@@ -76,6 +77,21 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
             continue;
         }
 
+        // Idempotency guard: skip if an order already exists for this intent.
+        // Prevents double-submission when the loop retries before status is persisted.
+        match order_repo.order_exists_for_intent(intent.id).await {
+            Ok(true) => {
+                warn!(intent_id = %intent.id, "order already exists for this copy intent — marking executed, skipping exchange call");
+                copy_repo.update_status(intent.id, "executed").await?;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(intent_id = %intent.id, "could not check for existing order: {} — skipping to avoid duplicate submission", e);
+                continue;
+            }
+        }
+
         let result = match intent.platform.as_str() {
             "kalshi" => {
                 if let Some(entry) =
@@ -107,8 +123,7 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
 
         match result {
             Ok(output) => {
-                let repo = OrderRepository::new(pool.clone());
-                let order_id = repo.insert_from_live_output(output, intent).await?;
+                let order_id = order_repo.insert_from_live_output(output, intent).await?;
                 copy_repo.update_status(intent.id, "executed").await?;
                 executed += 1;
 

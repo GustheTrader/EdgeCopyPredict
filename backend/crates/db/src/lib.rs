@@ -568,6 +568,16 @@ impl OrderRepository {
         .await?;
         Ok(())
     }
+
+    pub async fn order_exists_for_intent(&self, copy_intent_id: Uuid) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM orders WHERE copy_intent_id = $1)",
+        )
+        .bind(copy_intent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
 }
 
 #[derive(Clone)]
@@ -1272,6 +1282,44 @@ impl OrderRepository {
         .bind(intent.target_contracts)
         .bind(fill_contracts)
         .bind(fill_price)
+        .execute(&self.pool)
+        .await?;
+        Ok(order_id)
+    }
+
+    /// Insert a paper order that has no backing copy_intent (e.g. from oddpool_copy).
+    /// copy_intent_id is NULL so no FK constraint is violated.
+    pub async fn insert_paper_order_no_intent(
+        &self,
+        follower_account_id: Uuid,
+        platform: &str,
+        market_id: Option<Uuid>,
+        outcome: &str,
+        side: &str,
+        price: Decimal,
+        contracts: Decimal,
+    ) -> Result<Uuid> {
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (
+                id, copy_intent_id, platform, follower_account_id,
+                platform_order_id, client_order_id, market_id, outcome, side,
+                order_type, price_limit, requested_contracts, filled_contracts,
+                avg_fill_price, status, submitted_at, last_update_at
+            ) VALUES (
+                $1, NULL, $2, $3, NULL, $4, $5, $6, $7,
+                'market', $8, $9, $9, $8, 'filled', NOW(), NOW()
+            )"#,
+        )
+        .bind(order_id)
+        .bind(platform)
+        .bind(follower_account_id)
+        .bind(format!("oddpool:{}", order_id))
+        .bind(market_id)
+        .bind(outcome)
+        .bind(side)
+        .bind(price)
+        .bind(contracts)
         .execute(&self.pool)
         .await?;
         Ok(order_id)

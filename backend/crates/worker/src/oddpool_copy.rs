@@ -12,8 +12,9 @@
 use anyhow::Result;
 use arbitek_config::AppConfig;
 use arbitek_db::{
-    connect, MarketMappingRepository, MasterRepository, PositionRepository, RawEventRecord,
-    RawEventRepository, SignalRecord, SignalRepository, SystemSettingsRepository,
+    connect, FillRepository, MarketMappingRepository, MasterRepository, OrderRepository,
+    PositionRepository, RawEventRecord, RawEventRepository, SignalRecord, SignalRepository,
+    SystemSettingsRepository,
 };
 use arbitek_platform_polymarket::PolymarketDataApiClient;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
@@ -46,6 +47,8 @@ pub async fn run_oddpool_copy(config: &AppConfig) -> Result<()> {
     let signal_repo = SignalRepository::new(pool.clone());
     let master_repo = MasterRepository::new(pool.clone());
     let mapping_repo = MarketMappingRepository::new(pool.clone());
+    let order_repo = OrderRepository::new(pool.clone());
+    let fill_repo = FillRepository::new(pool.clone());
     let position_repo = PositionRepository::new(pool.clone());
     let settings_repo = SystemSettingsRepository::new(pool.clone());
     let poly_client = PolymarketDataApiClient::new(&config.polymarket.data_api_base_url);
@@ -72,6 +75,8 @@ pub async fn run_oddpool_copy(config: &AppConfig) -> Result<()> {
             &signal_repo,
             &master_repo,
             &mapping_repo,
+            &order_repo,
+            &fill_repo,
             &position_repo,
             &settings_repo,
         )
@@ -89,6 +94,8 @@ async fn run_once(
     signal_repo: &SignalRepository,
     master_repo: &MasterRepository,
     mapping_repo: &MarketMappingRepository,
+    order_repo: &OrderRepository,
+    fill_repo: &FillRepository,
     position_repo: &PositionRepository,
     settings_repo: &SystemSettingsRepository,
 ) -> Result<()> {
@@ -273,12 +280,48 @@ async fn run_once(
                 "[PAPER] simulated trade (with slippage) — wallet updated"
             );
 
-            // --- Position upsert ---
+            // --- Order + fill + position ---
             let market_uuid = condition_id_to_uuid(&condition_id);
-            let contracts_delta = if paper_action == "buy" {
-                contracts
-            } else {
-                -contracts
+            let contracts_delta = if paper_action == "buy" { contracts } else { -contracts };
+
+            let order_id = match order_repo
+                .insert_paper_order_no_intent(
+                    follower_id,
+                    "polymarket",
+                    Some(market_uuid),
+                    &outcome_label,
+                    paper_action,
+                    sim_price,
+                    contracts,
+                )
+                .await
+            {
+                Ok(id) => {
+                    let _ = fill_repo
+                        .insert(
+                            id,
+                            "polymarket",
+                            &format!("oddpool:fill:{}", Uuid::new_v4()),
+                            follower_id,
+                            Some(market_uuid),
+                            market_title.as_deref(),
+                            &outcome_label,
+                            paper_action,
+                            sim_price,
+                            contracts,
+                            notional,
+                            fee,
+                            Some(true),
+                            OffsetDateTime::now_utc(),
+                            &serde_json::json!({}),
+                        )
+                        .await;
+                    Some(id)
+                }
+                Err(e) => {
+                    warn!(condition_id = %condition_id, "oddpool order insert failed: {}", e);
+                    None
+                }
             };
 
             if let Err(e) = position_repo
@@ -297,6 +340,8 @@ async fn run_once(
             {
                 warn!(condition_id = %condition_id, "position upsert failed: {}", e);
             }
+
+            let _ = order_id; // referenced above
 
             // --- Signal record ---
             let _ = store_signal(
