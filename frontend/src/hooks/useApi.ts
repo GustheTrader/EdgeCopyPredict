@@ -100,7 +100,11 @@ export function useOrders() {
 }
 
 export function usePositions() {
-  return useQuery({ queryKey: ["positions"], queryFn: () => fetchJson<any[]>("/positions") });
+  return useQuery({
+    queryKey: ["positions"],
+    queryFn: () => fetchJson<any[]>("/positions"),
+    refetchInterval: 15000,
+  });
 }
 
 export function useAlerts() {

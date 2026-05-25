@@ -511,7 +511,7 @@ async fn db_paper_wallet_seeded_at_1000_on_first_start() {
         .await
         .ok();
 
-    // Replicate the oddpool_copy worker seeding logic
+    // Replicate the paper wallet seeding logic (done at startup)
     if settings
         .get("paper_wallet_balance")
         .await

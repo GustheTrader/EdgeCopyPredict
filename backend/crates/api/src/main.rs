@@ -1382,8 +1382,8 @@ async fn reset_paper_wallet(State(state): State<AppState>) -> ApiResult<Json<Sys
 /// Called from toggle (live→paper) and the explicit reset endpoint.
 /// Positions are cleared so the ledger matches the fresh wallet.
 /// raw_events dedup cache is intentionally kept — deleting it would cause
-/// the oddpool_copy worker to immediately re-process all recent Polymarket
-/// trades on its next poll, re-draining the wallet within seconds.
+/// the ingest worker to re-process all recent Polymarket trades on its next
+/// poll, generating duplicate copy_intents and re-draining the wallet.
 /// Both ops run in one transaction so a partial failure leaves no stale state.
 async fn reset_paper_state(
     pool: &sqlx::PgPool,

@@ -6,7 +6,6 @@ use tracing::{error, info};
 
 mod ingest;
 mod live_execution;
-mod oddpool_copy;
 mod paper_execution;
 mod pnl_refresh;
 mod queue_consume;
@@ -147,15 +146,6 @@ async fn main() -> Result<()> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("shutting down pnl-refresh worker");
-                    Ok(())
-                }
-            }
-        }
-        "oddpool-copy" => {
-            tokio::select! {
-                result = oddpool_copy::run_oddpool_copy(&config) => result,
-                _ = shutdown_rx.recv() => {
-                    info!("shutting down oddpool-copy worker");
                     Ok(())
                 }
             }

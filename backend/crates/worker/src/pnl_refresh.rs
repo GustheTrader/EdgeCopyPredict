@@ -2,6 +2,7 @@ use anyhow::Result;
 use arbitek_config::AppConfig;
 use arbitek_db::{
     connect_worker as connect, MarketMappingRecord, MarketMappingRepository, PositionRepository,
+    RawEventRepository,
 };
 use arbitek_platform_kalshi::KalshiDataApiClient;
 use arbitek_platform_polymarket::{clob::PolymarketClobClient, PolymarketDataApiClient};
@@ -14,6 +15,7 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
     let pool = connect(&config.database_url).await?;
     let position_repo = PositionRepository::new(pool.clone());
     let mapping_repo = MarketMappingRepository::new(pool.clone());
+    let raw_repo = RawEventRepository::new(pool.clone());
 
     let kalshi_client = KalshiDataApiClient::new(&config.kalshi.rest_api_base_url, None);
     let poly_data_client = PolymarketDataApiClient::new(&config.polymarket.data_api_base_url);
@@ -60,13 +62,28 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
         );
 
         for pos in &positions {
-            let mapping = match mappings.get(&pos.market_id) {
-                Some(m) => m,
-                None => continue, // no mapping — skip silently (already counted above)
+            // Resolve condition_id: either from a market mapping or by recovering it
+            // from raw_events for unmapped positions (no market_mappings entry).
+            let poly_condition_id: Option<String> = if let Some(m) = mappings.get(&pos.market_id) {
+                Some(m.polymarket_condition_id.clone())
+            } else if pos.platform == "polymarket" {
+                match raw_repo.find_condition_id_by_market_uuid(pos.market_id).await {
+                    Ok(cid) => cid,
+                    Err(e) => {
+                        warn!(position_id = %pos.id, error = %e, "failed to look up condition_id");
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             let current_price = match pos.platform.as_str() {
                 "kalshi" => {
+                    let mapping = match mappings.get(&pos.market_id) {
+                        Some(m) => m,
+                        None => continue,
+                    };
                     let ticker = &mapping.kalshi_ticker;
                     match kalshi_client.get_market_price(ticker).await {
                         Ok(Some(price)) => Some(price),
@@ -81,8 +98,11 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
                     }
                 }
                 "polymarket" => {
-                    let condition_id = &mapping.polymarket_condition_id;
-                    match poly_data_client.get_market_by_condition(condition_id).await {
+                    let condition_id = match poly_condition_id.as_deref() {
+                        Some(c) => c.to_owned(),
+                        None => continue,
+                    };
+                    match poly_data_client.get_market_by_condition(&condition_id).await {
                         Ok(Some(market_info)) => {
                             let token_id = extract_token_id(&market_info, &pos.outcome);
                             match token_id {

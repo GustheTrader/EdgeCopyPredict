@@ -32,6 +32,7 @@ export function PositionsPage() {
               <th className="px-4 py-2 text-right">Contracts</th>
               <th className="px-4 py-2 text-right">Avg Price</th>
               <th className="px-4 py-2 text-right">Exposure</th>
+              <th className="px-4 py-2 text-right">Unrealized P&L</th>
               <th className="px-4 py-2 text-right">Realized P&L</th>
               <th className="px-4 py-2">Updated</th>
             </tr>
@@ -65,6 +66,11 @@ export function PositionsPage() {
                 </td>
                 <td className="px-4 py-2 text-right text-gray-300 text-xs">
                   {fmt(Number(p.exposure))}
+                </td>
+                <td className={`px-4 py-2 text-right text-xs font-medium ${
+                  Number(p.unrealized_pnl) >= 0 ? "text-green-400" : "text-red-400"
+                }`}>
+                  {fmt(Number(p.unrealized_pnl))}
                 </td>
                 <td className={`px-4 py-2 text-right text-xs font-medium ${
                   Number(p.realized_pnl) >= 0 ? "text-green-400" : "text-red-400"

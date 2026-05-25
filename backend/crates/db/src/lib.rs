@@ -1287,43 +1287,6 @@ impl OrderRepository {
         Ok(order_id)
     }
 
-    /// Insert a paper order that has no backing copy_intent (e.g. from oddpool_copy).
-    /// copy_intent_id is NULL so no FK constraint is violated.
-    pub async fn insert_paper_order_no_intent(
-        &self,
-        follower_account_id: Uuid,
-        platform: &str,
-        market_id: Option<Uuid>,
-        outcome: &str,
-        side: &str,
-        price: Decimal,
-        contracts: Decimal,
-    ) -> Result<Uuid> {
-        let order_id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO orders (
-                id, copy_intent_id, platform, follower_account_id,
-                platform_order_id, client_order_id, market_id, outcome, side,
-                order_type, price_limit, requested_contracts, filled_contracts,
-                avg_fill_price, status, submitted_at, last_update_at
-            ) VALUES (
-                $1, NULL, $2, $3, NULL, $4, $5, $6, $7,
-                'market', $8, $9, $9, $8, 'filled', NOW(), NOW()
-            )"#,
-        )
-        .bind(order_id)
-        .bind(platform)
-        .bind(follower_account_id)
-        .bind(format!("oddpool:{}", order_id))
-        .bind(market_id)
-        .bind(outcome)
-        .bind(side)
-        .bind(price)
-        .bind(contracts)
-        .execute(&self.pool)
-        .await?;
-        Ok(order_id)
-    }
 }
 
 pub struct RawEventRepository {
@@ -1390,6 +1353,24 @@ impl RawEventRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Recover the Polymarket condition_id for a position whose market_id was derived
+    /// from the first 16 bytes of the condition_id hex. Searches all raw_events by
+    /// matching the condition_id prefix against the UUID's hex representation.
+    pub async fn find_condition_id_by_market_uuid(&self, market_id: Uuid) -> Result<Option<String>> {
+        let prefix = market_id.as_simple().to_string(); // 32 hex chars, no dashes
+        let pattern = format!("0x{}%", prefix);
+        let row: Option<String> = sqlx::query_scalar(
+            r#"SELECT raw_payload->>'conditionId'
+               FROM raw_events
+               WHERE lower(raw_payload->>'conditionId') LIKE lower($1)
+               LIMIT 1"#,
+        )
+        .bind(pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     pub async fn delete_by_source(&self, source: &str) -> Result<u64> {
