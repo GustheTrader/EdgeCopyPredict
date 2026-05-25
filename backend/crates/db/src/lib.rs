@@ -570,12 +570,11 @@ impl OrderRepository {
     }
 
     pub async fn order_exists_for_intent(&self, copy_intent_id: Uuid) -> Result<bool> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM orders WHERE copy_intent_id = $1)",
-        )
-        .bind(copy_intent_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orders WHERE copy_intent_id = $1)")
+                .bind(copy_intent_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(exists)
     }
 }
@@ -1286,7 +1285,6 @@ impl OrderRepository {
         .await?;
         Ok(order_id)
     }
-
 }
 
 pub struct RawEventRepository {
@@ -1358,7 +1356,10 @@ impl RawEventRepository {
     /// Recover the Polymarket condition_id for a position whose market_id was derived
     /// from the first 16 bytes of the condition_id hex. Searches all raw_events by
     /// matching the condition_id prefix against the UUID's hex representation.
-    pub async fn find_condition_id_by_market_uuid(&self, market_id: Uuid) -> Result<Option<String>> {
+    pub async fn find_condition_id_by_market_uuid(
+        &self,
+        market_id: Uuid,
+    ) -> Result<Option<String>> {
         let prefix = market_id.as_simple().to_string(); // 32 hex chars, no dashes
         let pattern = format!("0x{}%", prefix);
         let row: Option<String> = sqlx::query_scalar(
