@@ -22,6 +22,21 @@ function pct(n: number | null | undefined) {
   return `${(n * 100).toFixed(1)}%`;
 }
 
+function cents(n: number | null | undefined) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}¢`;
+}
+
+function positionTotalPnl(p: any) {
+  return Number(p.realized_pnl ?? 0) + Number(p.unrealized_pnl ?? 0);
+}
+
+function markPrice(p: any) {
+  const contracts = Number(p.contracts);
+  if (!Number.isFinite(contracts) || contracts === 0) return null;
+  return Number(p.avg_price ?? 0) + Number(p.unrealized_pnl ?? 0) / contracts;
+}
+
 function StatCard({
   label,
   value,
@@ -54,15 +69,26 @@ export function Dashboard() {
   const liveSignals = useSignals();
   const toggleSystem = useToggleSystem();
 
-  const totalPnl = pnl?.reduce((s, r) => s + r.total_pnl, 0) ?? null;
-  const unrealizedPnl = pnl?.reduce((s, r) => s + r.unrealized_pnl, 0) ?? null;
-  const realizedPnl = pnl?.reduce((s, r) => s + r.realized_pnl, 0) ?? null;
-  const openPositions = pnl?.reduce((s, r) => s + r.open_positions, 0) ?? null;
+  const allPositions = positions ?? [];
+  const openPos = allPositions.filter((p: any) => Number(p.contracts) !== 0);
+  const positionStats = allPositions.length > 0 ? {
+    totalPnl: allPositions.reduce((s: number, p: any) => s + positionTotalPnl(p), 0),
+    unrealizedPnl: allPositions.reduce((s: number, p: any) => s + Number(p.unrealized_pnl ?? 0), 0),
+    realizedPnl: allPositions.reduce((s: number, p: any) => s + Number(p.realized_pnl ?? 0), 0),
+    openPositions: openPos.length,
+  } : null;
+
+  const totalPnl = positionStats?.totalPnl ?? pnl?.reduce((s, r) => s + r.total_pnl, 0) ?? null;
+  const unrealizedPnl = positionStats?.unrealizedPnl ?? pnl?.reduce((s, r) => s + r.unrealized_pnl, 0) ?? null;
+  const realizedPnl = positionStats?.realizedPnl ?? pnl?.reduce((s, r) => s + r.realized_pnl, 0) ?? null;
+  const openPositions = positionStats?.openPositions ?? pnl?.reduce((s, r) => s + r.open_positions, 0) ?? null;
   const winRate = pnl && pnl.length > 0 ? pnl.reduce((s, r) => s + r.win_rate, 0) / pnl.length : null;
+  const paperCash = status?.paper_wallet_balance ?? null;
+  const paperEquity = totalPnl != null ? 1000 + totalPnl : paperCash;
 
   const activeMasters = masters?.filter((m) => m.status === "active").length ?? 0;
   const activeFollowers = followers?.filter((f) => f.status === "active").length ?? 0;
-  const openAlerts = alerts?.filter((a) => !a.acked).length ?? status?.open_alert_count ?? 0;
+  const openAlerts = alerts?.filter((a) => a.status === "open").length ?? status?.open_alert_count ?? 0;
 
   // Merge live SSE signals on top of REST, deduped by id
   const recentSignals = useMemo(() => {
@@ -73,8 +99,6 @@ export function Dashboard() {
       .sort((a, b) => new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime())
       .slice(0, 8);
   }, [restSignals, liveSignals]);
-
-  const openPos = (positions ?? []).filter((p: any) => Number(p.contracts) > 0);
 
   return (
     <div className="space-y-6">
@@ -130,11 +154,11 @@ export function Dashboard() {
                   ? (balances?.kalshi_balance != null
                       ? fmt(balances.kalshi_balance)
                       : <span className="text-sm text-red-400">{balances?.kalshi_error ?? "—"}</span>)
-                  : fmt(status?.paper_wallet_balance ?? 1000)
+                  : fmt(paperEquity)
                 }
               </p>
               <p className="text-xs text-gray-600">
-                {status?.kalshi_execution_enabled ? "USDC · production" : "Demo wallet · Supabase"}
+                {status?.kalshi_execution_enabled ? "USDC · production" : `Cash available ${fmt(paperCash)}`}
               </p>
             </div>
           </div>
@@ -181,15 +205,16 @@ export function Dashboard() {
             color={totalPnl != null ? (totalPnl >= 0 ? "text-green-400" : "text-red-400") : "text-white"}
           />
           <StatCard
-            label="Realized"
+            label="Closed P&L"
             value={fmt(realizedPnl)}
             color={realizedPnl != null ? (realizedPnl >= 0 ? "text-green-400" : "text-red-400") : "text-white"}
+            sub="updates after exits"
           />
           <StatCard
-            label="Unrealized"
+            label="Open P&L"
             value={fmt(unrealizedPnl)}
             color={unrealizedPnl != null ? (unrealizedPnl >= 0 ? "text-green-400" : "text-red-400") : "text-white"}
-            sub="mark-to-market"
+            sub="moves while positions are open"
           />
           <StatCard label="Win Rate" value={pct(winRate)} />
           <StatCard label="Open Positions" value={openPositions ?? "—"} />
@@ -302,7 +327,7 @@ export function Dashboard() {
         </div>
 
         {/* Open Positions */}
-        <div className="rounded-lg border border-gray-800 bg-gray-950">
+        <div className="rounded-lg border border-gray-800 bg-gray-950 overflow-x-auto">
           <div className="px-4 py-3 border-b border-gray-800">
             <h3 className="text-sm font-semibold text-gray-300">
               Open Positions
@@ -321,7 +346,10 @@ export function Dashboard() {
                   <th className="px-4 py-2">Outcome</th>
                   <th className="px-4 py-2">Contracts</th>
                   <th className="px-4 py-2">Avg Price</th>
-                  <th className="px-4 py-2">Realized P&L</th>
+                  <th className="px-4 py-2">Mark</th>
+                  <th className="px-4 py-2">Open P&L</th>
+                  <th className="px-4 py-2">Total P&L</th>
+                  <th className="px-4 py-2">Updated</th>
                 </tr>
               </thead>
               <tbody>
@@ -334,9 +362,16 @@ export function Dashboard() {
                     </td>
                     <td className="px-4 py-2 text-gray-300 text-xs">{p.outcome}</td>
                     <td className="px-4 py-2 text-gray-300 text-xs">{Number(p.contracts).toFixed(2)}</td>
-                    <td className="px-4 py-2 text-gray-300 text-xs">{(Number(p.avg_price) * 100).toFixed(0)}¢</td>
-                    <td className={`px-4 py-2 text-xs font-medium ${Number(p.realized_pnl) >= 0 ? "text-green-400" : "text-red-400"}`}>
-                      {fmt(Number(p.realized_pnl))}
+                    <td className="px-4 py-2 text-gray-300 text-xs">{cents(Number(p.avg_price))}</td>
+                    <td className="px-4 py-2 text-gray-300 text-xs">{cents(markPrice(p))}</td>
+                    <td className={`px-4 py-2 text-xs font-medium ${Number(p.unrealized_pnl) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                      {fmt(Number(p.unrealized_pnl))}
+                    </td>
+                    <td className={`px-4 py-2 text-xs font-medium ${positionTotalPnl(p) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                      {fmt(positionTotalPnl(p))}
+                    </td>
+                    <td className="px-4 py-2 text-gray-500 text-xs whitespace-nowrap">
+                      {new Date(p.updated_at).toLocaleTimeString()}
                     </td>
                   </tr>
                 ))}

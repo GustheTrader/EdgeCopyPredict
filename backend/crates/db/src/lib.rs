@@ -34,11 +34,13 @@ async fn connect_pool(database_url: &str, max_connections: u32) -> Result<PgPool
     let base_url = database_url.split('?').next().unwrap_or(database_url);
     let opts = PgConnectOptions::from_str(base_url)?.statement_cache_capacity(0);
 
-    // Retry up to 12 times (60s total) — Supabase session-mode pooler caps at 15
-    // connections; stale connections from recently-killed processes hold slots
-    // until TCP keepalives time them out.
-    let mut last_err = anyhow::anyhow!("no connection attempts made");
-    for attempt in 1u32..=12 {
+    // Keep retrying when the session pool is temporarily saturated.
+    // These workers are long-lived background processes; exiting after one
+    // minute makes the entire trading pipeline brittle whenever stale sessions
+    // or a startup burst briefly exhaust the pool.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         match PgPoolOptions::new()
             .max_connections(max_connections)
             .min_connections(0)
@@ -56,16 +58,15 @@ async fn connect_pool(database_url: &str, max_connections: u32) -> Result<PgPool
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("EMAXCONNSESSION") || msg.contains("max clients") {
-                    eprintln!("[db] pool full ({attempt}/12), retrying in 5s…");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    last_err = e.into();
+                    let delay_secs = std::cmp::min(5 * attempt as u64, 60);
+                    eprintln!("[db] pool full ({attempt}), retrying in {delay_secs}s…");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                 } else {
                     return Err(e.into());
                 }
             }
         }
     }
-    Err(last_err)
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
@@ -182,6 +183,12 @@ pub struct PositionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SettledPositionRecord {
+    pub follower_account_id: Uuid,
+    pub settlement_cash: Decimal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AlertRecord {
     pub id: Uuid,
     pub severity: String,
@@ -207,6 +214,20 @@ pub struct RawEventRecord {
     pub status: String,
     pub source_entity_id: Option<Uuid>,
     pub source_entity_type: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaperWalletMovementRecord {
+    pub id: Uuid,
+    pub follower_account_id: Uuid,
+    pub movement_type: String,
+    pub amount: Decimal,
+    pub balance_after: Decimal,
+    pub source_type: Option<String>,
+    pub source_id: Option<Uuid>,
+    pub description: Option<String>,
+    pub payload: Value,
+    pub created_at: OffsetDateTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -703,17 +724,42 @@ impl PositionRepository {
         let limit = filter.per_page.max(1).min(200) as i64;
         let offset = ((filter.page.saturating_sub(1)) as i64) * limit;
 
+        let open_only = filter.open_only.unwrap_or(false);
         let rows = sqlx::query(
-            "select id, follower_account_id, platform, market_id, market_title, market_status, close_time, outcome, contracts, avg_price, realized_pnl, unrealized_pnl, exposure, updated_at from positions order by updated_at desc limit $1 offset $2"
+            r#"select id, follower_account_id, platform, market_id, market_title,
+                      market_status, close_time, outcome, contracts, avg_price,
+                      realized_pnl, unrealized_pnl, exposure, updated_at
+               from positions
+               where ($3::uuid is null or follower_account_id = $3)
+                 and ($4::text is null or platform = $4)
+                 and ($5::uuid is null or market_id = $5)
+                 and ($6::boolean = false or contracts <> 0)
+               order by updated_at desc
+               limit $1 offset $2"#,
         )
         .bind(limit)
         .bind(offset)
+        .bind(filter.follower_account_id)
+        .bind(filter.platform)
+        .bind(filter.market_id)
+        .bind(open_only)
         .fetch_all(&self.pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("select count(*) from positions")
-            .fetch_one(&self.pool)
-            .await?;
+        let total: i64 = sqlx::query_scalar(
+            r#"select count(*)
+               from positions
+               where ($1::uuid is null or follower_account_id = $1)
+                 and ($2::text is null or platform = $2)
+                 and ($3::uuid is null or market_id = $3)
+                 and ($4::boolean = false or contracts <> 0)"#,
+        )
+        .bind(filter.follower_account_id)
+        .bind(filter.platform)
+        .bind(filter.market_id)
+        .bind(open_only)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(PaginatedResult {
             items: rows.into_iter().map(position_from_row).collect(),
@@ -818,19 +864,51 @@ impl PositionRepository {
         Ok(())
     }
 
-    pub async fn refresh_unrealized_pnl(&self, id: Uuid, current_price: Decimal) -> Result<()> {
-        sqlx::query(
+    pub async fn refresh_unrealized_pnl(&self, id: Uuid, current_price: Decimal) -> Result<bool> {
+        let result = sqlx::query(
             r#"UPDATE positions SET
                 unrealized_pnl = contracts * ($1 - avg_price),
                 updated_at = NOW()
-            WHERE id = $2"#,
+            WHERE id = $2
+              AND unrealized_pnl IS DISTINCT FROM contracts * ($1 - avg_price)"#,
         )
         .persistent(false)
         .bind(current_price)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn settle_resolved_position(
+        &self,
+        id: Uuid,
+        settlement_price: Decimal,
+        close_time: Option<OffsetDateTime>,
+    ) -> Result<Option<SettledPositionRecord>> {
+        let row = sqlx::query(
+            r#"UPDATE positions SET
+                   realized_pnl = realized_pnl + contracts * ($1 - avg_price),
+                   contracts = 0,
+                   unrealized_pnl = 0,
+                   exposure = 0,
+                   market_status = 'closed',
+                   close_time = COALESCE($2, NOW()),
+                   updated_at = NOW()
+               WHERE id = $3
+                 AND contracts <> 0
+               RETURNING follower_account_id, contracts * $1 AS settlement_cash"#,
+        )
+        .persistent(false)
+        .bind(settlement_price)
+        .bind(close_time)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SettledPositionRecord {
+            follower_account_id: r.try_get("follower_account_id").unwrap_or_default(),
+            settlement_cash: r.try_get("settlement_cash").unwrap_or_default(),
+        }))
     }
 
     pub async fn list_open(&self, limit: i64) -> Result<Vec<PositionRecord>> {
@@ -1639,6 +1717,41 @@ fn market_mapping_from_row(row: sqlx::postgres::PgRow) -> MarketMappingRecord {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+pub struct PaperWalletMovementRepository {
+    pool: PgPool,
+}
+
+impl PaperWalletMovementRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn list_for_follower(
+        &self,
+        follower_account_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<PaperWalletMovementRecord>> {
+        let rows = sqlx::query(
+            r#"SELECT id, follower_account_id, movement_type, amount, balance_after,
+                      source_type, source_id, description, payload, created_at
+               FROM paper_wallet_movements
+               WHERE follower_account_id = $1
+               ORDER BY created_at DESC, id DESC
+               LIMIT $2"#,
+        )
+        .bind(follower_account_id)
+        .bind(limit.max(1).min(500))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(paper_wallet_movement_from_row)
+            .collect())
+    }
+}
+
+#[derive(Clone)]
 pub struct SystemSettingsRepository {
     pool: PgPool,
 }
@@ -1693,5 +1806,113 @@ impl SystemSettingsRepository {
 
     pub async fn set_decimal(&self, key: &str, value: rust_decimal::Decimal) -> Result<()> {
         self.set(key, &value.to_string()).await
+    }
+
+    pub async fn add_decimal(
+        &self,
+        key: &str,
+        delta: rust_decimal::Decimal,
+        default: rust_decimal::Decimal,
+    ) -> Result<rust_decimal::Decimal> {
+        let value: String = sqlx::query_scalar(
+            r#"INSERT INTO system_settings (key, value, updated_at)
+               VALUES ($1, ($2::numeric + $3::numeric)::text, NOW())
+               ON CONFLICT (key) DO UPDATE SET
+                   value = (COALESCE(NULLIF(system_settings.value, '')::numeric, $2::numeric) + $3::numeric)::text,
+                   updated_at = NOW()
+               RETURNING value"#,
+        )
+        .bind(key)
+        .bind(default)
+        .bind(delta)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(value.parse::<rust_decimal::Decimal>().unwrap_or(default))
+    }
+
+    pub async fn record_paper_wallet_movement(
+        &self,
+        follower_account_id: Uuid,
+        movement_type: &str,
+        amount: rust_decimal::Decimal,
+        source_type: Option<&str>,
+        source_id: Option<Uuid>,
+        description: Option<&str>,
+        payload: &Value,
+        default_balance: rust_decimal::Decimal,
+    ) -> Result<PaperWalletMovementRecord> {
+        if let (Some(source_type), Some(source_id)) = (source_type, source_id) {
+            if let Some(row) = sqlx::query(
+                r#"SELECT id, follower_account_id, movement_type, amount, balance_after,
+                          source_type, source_id, description, payload, created_at
+                   FROM paper_wallet_movements
+                   WHERE source_type = $1 AND source_id = $2 AND movement_type = $3"#,
+            )
+            .bind(source_type)
+            .bind(source_id)
+            .bind(movement_type)
+            .fetch_optional(&self.pool)
+            .await?
+            {
+                return Ok(paper_wallet_movement_from_row(row));
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let value: String = sqlx::query_scalar(
+            r#"INSERT INTO system_settings (key, value, updated_at)
+               VALUES ('paper_wallet_balance', ($1::numeric + $2::numeric)::text, NOW())
+               ON CONFLICT (key) DO UPDATE SET
+                   value = (COALESCE(NULLIF(system_settings.value, '')::numeric, $1::numeric) + $2::numeric)::text,
+                   updated_at = NOW()
+               RETURNING value"#,
+        )
+        .bind(default_balance)
+        .bind(amount)
+        .fetch_one(&mut *tx)
+        .await?;
+        let balance_after = value
+            .parse::<rust_decimal::Decimal>()
+            .unwrap_or(default_balance + amount);
+
+        let row = sqlx::query(
+            r#"INSERT INTO paper_wallet_movements (
+                   id, follower_account_id, movement_type, amount, balance_after,
+                   source_type, source_id, description, payload, created_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+               RETURNING id, follower_account_id, movement_type, amount, balance_after,
+                         source_type, source_id, description, payload, created_at"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(follower_account_id)
+        .bind(movement_type)
+        .bind(amount)
+        .bind(balance_after)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(description)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(paper_wallet_movement_from_row(row))
+    }
+}
+
+fn paper_wallet_movement_from_row(row: sqlx::postgres::PgRow) -> PaperWalletMovementRecord {
+    PaperWalletMovementRecord {
+        id: row.try_get("id").unwrap_or_default(),
+        follower_account_id: row.try_get("follower_account_id").unwrap_or_default(),
+        movement_type: row.try_get("movement_type").unwrap_or_default(),
+        amount: row.try_get("amount").unwrap_or_default(),
+        balance_after: row.try_get("balance_after").unwrap_or_default(),
+        source_type: row.try_get("source_type").ok().flatten(),
+        source_id: row.try_get("source_id").ok().flatten(),
+        description: row.try_get("description").ok().flatten(),
+        payload: row.try_get("payload").unwrap_or_default(),
+        created_at: row
+            .try_get("created_at")
+            .unwrap_or(OffsetDateTime::now_utc()),
     }
 }

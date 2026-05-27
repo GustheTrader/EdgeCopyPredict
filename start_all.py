@@ -234,7 +234,10 @@ def main():
             sys.exit(1)
         print("[OK] Build complete")
 
-    BIN_DIR = os.path.join(BACKEND_DIR, "target", "debug")
+    target_dir = ENV.get("CARGO_TARGET_DIR") or os.path.join(BACKEND_DIR, "target")
+    if not os.path.isabs(target_dir):
+        target_dir = os.path.join(BACKEND_DIR, target_dir)
+    BIN_DIR = os.path.join(target_dir, "debug")
 
     # -----------------------------------------------------------------------
     # Start API
@@ -244,7 +247,7 @@ def main():
         run(
             [os.path.join(BIN_DIR, "arbitek-api")],
             cwd=BACKEND_DIR,
-            env=ENV,
+            env={**ENV, "WORKER__MODE": "api"},
         )
         time.sleep(12)
 
@@ -253,12 +256,14 @@ def main():
     # -----------------------------------------------------------------------
     if args.full or args.workers:
         worker_modes = [
-            "oddpool-copy",        # Poly detection → Oddpool match → Kalshi demo execution
-            "ingest-kalshi",       # Kalshi raw event ingestion
-            "signal-normalize",    # Normalise any non-oddpool raw events
+            "signal-normalize",    # Normalize raw events into copy signals/intents
             "risk-evaluate",
+            "paper-execution",
             "execution-live",
             "reconcile",
+            "pnl-refresh",
+            "ingest-polymarket",   # Polymarket master-wallet trade ingestion
+            "ingest-kalshi",       # Kalshi raw event ingestion
         ]
         for mode in worker_modes:
             print(f"[START] Starting worker: {mode}")
@@ -267,6 +272,7 @@ def main():
                 cwd=BACKEND_DIR,
                 env={**ENV, "WORKER__MODE": mode},
             )
+            time.sleep(3)
 
     # -----------------------------------------------------------------------
     # Start frontend

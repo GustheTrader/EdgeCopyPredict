@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arbitek_domain::Platform;
 use k256::ecdsa::{signature::Signer, SigningKey};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -178,6 +178,30 @@ impl PolymarketClobClient {
             .await
             .context("failed to decode Polymarket orderbook")?;
         Ok(response)
+    }
+
+    /// Get market info by condition id, including token ids and token prices.
+    pub async fn get_market_by_condition(&self, condition_id: &str) -> Result<Option<Value>> {
+        self.rate_limiter.acquire("polymarket_clob_market").await;
+        let url = format!("{}/markets/{}", self.base_url, condition_id);
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("failed to fetch Polymarket market info")?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let market = response
+            .error_for_status()
+            .context("Polymarket market endpoint returned an error")?
+            .json()
+            .await
+            .context("failed to decode Polymarket market response")?;
+        Ok(Some(market))
     }
 
     /// Get mid price from orderbook for a token.

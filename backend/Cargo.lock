@@ -247,6 +247,7 @@ dependencies = [
  "arbitek-platform-kalshi",
  "arbitek-platform-polymarket",
  "arbitek-queue",
+ "hex",
  "rust_decimal",
  "secrecy",
  "serde",

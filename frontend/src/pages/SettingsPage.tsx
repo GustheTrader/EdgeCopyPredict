@@ -1,10 +1,40 @@
-import { useSystemStatus, useToggleSystem, useToggleKalshiExecution, useResetPaperWallet } from "@/hooks/useApi";
+import {
+  useSystemStatus,
+  useToggleKalshiExecution,
+  useResetPaperWallet,
+  usePaperWalletMovements,
+  type PaperWalletMovement,
+} from "@/hooks/useApi";
 import { GlobalKillSwitch } from "@/components/layout/GlobalKillSwitch";
+
+const money = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+function formatSignedMoney(value: number) {
+  return `${value >= 0 ? "+" : ""}${money.format(value)}`;
+}
+
+function movementLabel(type: string) {
+  return type
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function movementSource(movement: PaperWalletMovement) {
+  if (movement.source_type && movement.source_id) return `${movement.source_type}:${movement.source_id.slice(0, 8)}`;
+  return movement.source_type || "-";
+}
 
 export function SettingsPage() {
   const { data: status, isLoading } = useSystemStatus();
   const toggleKalshi = useToggleKalshiExecution();
   const resetWallet = useResetPaperWallet();
+  const { data: walletMovements = [] } = usePaperWalletMovements();
   const kalshiEnabled = status?.kalshi_execution_enabled ?? false;
   const paperBalance = status?.paper_wallet_balance ?? 1000;
 
@@ -61,21 +91,73 @@ export function SettingsPage() {
 
           {/* Paper wallet balance + reset */}
           {!kalshiEnabled && (
-            <div className="flex items-center justify-between rounded bg-gray-900 border border-gray-800 px-4 py-3">
-              <div>
-                <p className="text-xs text-gray-500">Demo Wallet Balance (Supabase)</p>
-                <p className="text-lg font-semibold text-yellow-300 mt-0.5">
-                  ${paperBalance.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </p>
-                <p className="text-xs text-gray-600 mt-0.5">Decreases with each paper trade</p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between rounded bg-gray-900 border border-gray-800 px-4 py-3">
+                <div>
+                  <p className="text-xs text-gray-500">Demo Wallet Balance (Supabase)</p>
+                  <p className="text-lg font-semibold text-yellow-300 mt-0.5">
+                    {money.format(paperBalance)}
+                  </p>
+                  <p className="text-xs text-gray-600 mt-0.5">Cash ledger updates with every paper wallet movement</p>
+                </div>
+                <button
+                  onClick={() => resetWallet.mutate()}
+                  disabled={resetWallet.isPending}
+                  className="rounded px-3 py-1.5 text-xs font-medium bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {resetWallet.isPending ? "Resetting..." : "Reset to $1,000"}
+                </button>
               </div>
-              <button
-                onClick={() => resetWallet.mutate()}
-                disabled={resetWallet.isPending}
-                className="rounded px-3 py-1.5 text-xs font-medium bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {resetWallet.isPending ? "Resetting..." : "Reset to $1,000"}
-              </button>
+
+              <div className="rounded bg-gray-900 border border-gray-800 overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
+                  <h4 className="text-xs font-medium uppercase tracking-wide text-gray-400">Paper Wallet Ledger</h4>
+                  <span className="text-xs text-gray-600">{walletMovements.length} rows</span>
+                </div>
+                <div className="max-h-80 overflow-auto">
+                  <table className="min-w-full text-xs">
+                    <thead className="bg-gray-950 text-gray-500">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-medium">Time</th>
+                        <th className="px-3 py-2 text-left font-medium">Type</th>
+                        <th className="px-3 py-2 text-right font-medium">Amount</th>
+                        <th className="px-3 py-2 text-right font-medium">Balance</th>
+                        <th className="px-3 py-2 text-left font-medium">Source</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-800">
+                      {walletMovements.slice(0, 50).map((movement) => (
+                        <tr key={movement.id} className="text-gray-300">
+                          <td className="px-3 py-2 whitespace-nowrap text-gray-500">
+                            {new Date(movement.created_at).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            {movementLabel(movement.movement_type)}
+                          </td>
+                          <td className={`px-3 py-2 text-right whitespace-nowrap font-medium ${
+                            movement.amount >= 0 ? "text-emerald-300" : "text-red-300"
+                          }`}>
+                            {formatSignedMoney(movement.amount)}
+                          </td>
+                          <td className="px-3 py-2 text-right whitespace-nowrap text-gray-200">
+                            {money.format(movement.balance_after)}
+                          </td>
+                          <td className="px-3 py-2 max-w-[180px] truncate text-gray-500">
+                            {movementSource(movement)}
+                          </td>
+                        </tr>
+                      ))}
+                      {walletMovements.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="px-3 py-6 text-center text-gray-600">
+                            No wallet movements recorded
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           )}
         </div>

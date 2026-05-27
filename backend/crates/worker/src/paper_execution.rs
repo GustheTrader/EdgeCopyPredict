@@ -60,6 +60,15 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
     let mut rejected = 0usize;
 
     for intent in &intents {
+        if order_repo.order_exists_for_intent(intent.id).await? {
+            warn!(
+                intent_id = %intent.id,
+                "[PAPER] copy intent already has an order; marking executed without another wallet debit"
+            );
+            copy_repo.update_status(intent.id, "executed").await?;
+            continue;
+        }
+
         let contracts = intent.target_contracts;
         let price = intent.price_limit;
         let notional = contracts * price;
@@ -97,15 +106,44 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
             continue;
         }
 
-        // Update paper wallet balance
-        let new_balance = if is_buy {
-            (balance - notional - fee).max(Decimal::ZERO)
+        let cash_delta = if is_buy {
+            -(notional + fee)
         } else {
-            balance + notional - fee
+            notional - fee
         };
-        settings
-            .set_decimal("paper_wallet_balance", new_balance)
+        let movement_payload = json!({
+            "copy_intent_id": intent.id,
+            "platform": intent.platform.as_str(),
+            "market_id": intent.market_id,
+            "signal_platform_market_id": intent.signal_platform_market_id.as_str(),
+            "market_title": intent.market_title.as_deref(),
+            "outcome": intent.outcome.as_str(),
+            "side": intent.action.as_str(),
+            "price": price,
+            "contracts": contracts,
+            "notional": notional,
+            "fee": fee
+        });
+        let movement_description = format!(
+            "{} {} {} @ {}",
+            intent.action.to_uppercase(),
+            contracts,
+            intent.outcome,
+            price
+        );
+        let wallet_movement = settings
+            .record_paper_wallet_movement(
+                intent.follower_account_id,
+                if is_buy { "paper_buy" } else { "paper_sell" },
+                cash_delta,
+                Some("copy_intent"),
+                Some(intent.id),
+                Some(&movement_description),
+                &movement_payload,
+                Decimal::new(1000, 0),
+            )
             .await?;
+        let new_balance = wallet_movement.balance_after;
 
         // Insert paper order (immediately "filled")
         let order_id = order_repo

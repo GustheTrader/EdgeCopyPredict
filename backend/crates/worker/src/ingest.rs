@@ -3,7 +3,9 @@ use arbitek_config::AppConfig;
 use arbitek_db::{connect_worker as connect, MasterRepository, RawEventRecord, RawEventRepository};
 use arbitek_platform_kalshi::{KalshiAuth, KalshiDataApiClient, KalshiDataApiTrade};
 #[allow(unused_imports)]
-use arbitek_platform_polymarket::{PolymarketDataApiClient, PolymarketDataApiTrade};
+use arbitek_platform_polymarket::{
+    clob::PolymarketClobClient, PolymarketDataApiClient, PolymarketDataApiTrade,
+};
 use serde_json;
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -19,6 +21,7 @@ pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
     let raw_repo = RawEventRepository::new(pool.clone());
     let master_repo = MasterRepository::new(pool.clone());
     let client = PolymarketDataApiClient::new(&config.polymarket.data_api_base_url);
+    let market_client = PolymarketClobClient::new(&config.polymarket.clob_api_base_url);
 
     info!("starting polymarket data api ingestion");
 
@@ -90,7 +93,7 @@ pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
                             if let Some(cached) = market_title_cache.get(cond_id) {
                                 Some(cached.clone())
                             } else {
-                                match client.get_market_by_condition(cond_id).await {
+                                match market_client.get_market_by_condition(cond_id).await {
                                     Ok(Some(market_info)) => {
                                         let title = market_info
                                             .get("question")

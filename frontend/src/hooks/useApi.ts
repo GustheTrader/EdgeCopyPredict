@@ -4,6 +4,19 @@ import { toast } from "@/stores/toastStore";
 
 const API_BASE = "/api/v1";
 
+export type PaperWalletMovement = {
+  id: string;
+  follower_account_id: string;
+  movement_type: string;
+  amount: number;
+  balance_after: number;
+  source_type: string | null;
+  source_id: string | null;
+  description: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
 export class AuthError extends Error {
   constructor() {
     super("Session expired — please log in again");
@@ -103,7 +116,7 @@ export function usePositions() {
   return useQuery({
     queryKey: ["positions"],
     queryFn: () => fetchJson<any[]>("/positions"),
-    refetchInterval: 15000,
+    refetchInterval: 5000,
   });
 }
 
@@ -157,7 +170,15 @@ export function usePnlSummary() {
       trade_count: number;
       open_positions: number;
     }>>("/pnl"),
-    refetchInterval: 15000,
+    refetchInterval: 5000,
+  });
+}
+
+export function usePaperWalletMovements() {
+  return useQuery({
+    queryKey: ["paper-wallet-movements"],
+    queryFn: () => fetchJson<PaperWalletMovement[]>("/paper-wallet/movements"),
+    refetchInterval: 5000,
   });
 }
 
@@ -196,6 +217,7 @@ export function useResetPaperWallet() {
     onSuccess: (data) => {
       qc.setQueryData(["system-status"], data);
       qc.invalidateQueries({ queryKey: ["system-status"] });
+      qc.invalidateQueries({ queryKey: ["paper-wallet-movements"] });
       toast.success("Paper wallet reset to $1,000");
     },
     onError: onErr("Failed to reset paper wallet"),

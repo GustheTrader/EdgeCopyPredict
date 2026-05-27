@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use arbitek_config::{init_tracing, AppConfig};
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -151,8 +151,7 @@ async fn main() -> Result<()> {
             }
         }
         other => {
-            info!("worker mode '{}' completed (no-op)", other);
-            Ok(())
+            bail!("unsupported worker mode '{}'", other)
         }
     };
 

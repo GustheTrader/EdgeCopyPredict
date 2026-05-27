@@ -2,7 +2,7 @@ use anyhow::Result;
 use arbitek_config::{init_tracing, AppConfig};
 use arbitek_db::{
     AlertRepository, FillFilter, FillRepository, FollowerRepository, MasterRepository,
-    OrderRepository, PositionFilter, PositionRepository, RawEventRepository, SignalFilter,
+    OrderRepository, PaperWalletMovementRepository, PositionFilter, PositionRepository,
     SignalRepository,
 };
 use axum::{
@@ -341,6 +341,21 @@ struct PnlSummaryDto {
     open_positions: i64,
 }
 
+#[derive(Serialize, Clone)]
+struct PaperWalletMovementDto {
+    id: Uuid,
+    follower_account_id: Uuid,
+    movement_type: String,
+    amount: f64,
+    balance_after: f64,
+    source_type: Option<String>,
+    source_id: Option<Uuid>,
+    description: Option<String>,
+    payload: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -422,6 +437,12 @@ async fn main() -> Result<()> {
     info!("connecting database pool");
     let pool = arbitek_db::connect_api(&config.database_url).await?;
     info!("database pool connected");
+
+    if config.worker.run_migrations_on_startup {
+        info!("running database migrations");
+        arbitek_db::run_migrations(&pool).await?;
+        info!("database migrations complete");
+    }
 
     // Sync master wallets from COPY_WALLETS env var → masters table.
     // This ensures the worker always polls the correct addresses.
@@ -507,6 +528,10 @@ fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/system/status", get(system_status))
+        .route(
+            "/api/v1/paper-wallet/movements",
+            get(list_paper_wallet_movements),
+        )
         .route("/api/v1/masters", get(list_masters))
         .route("/api/v1/masters", post(create_master))
         .route("/api/v1/masters/:id", get(get_master).delete(delete_master))
@@ -592,6 +617,23 @@ async fn system_status(State(state): State<AppState>) -> ApiResult<Json<SystemSt
         open_alert_count: open_count,
         last_signal_at: last_ts.and_then(|dt| dt.format(&Rfc3339).ok()),
     }))
+}
+
+async fn list_paper_wallet_movements(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<PaperWalletMovementDto>>> {
+    const PAPER_FOLLOWER: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let follower_id = Uuid::parse_str(PAPER_FOLLOWER).expect("sentinel UUID is valid");
+    let records = PaperWalletMovementRepository::new(state.pool)
+        .list_for_follower(follower_id, 200)
+        .await?;
+
+    Ok(Json(
+        records
+            .into_iter()
+            .map(paper_wallet_movement_to_dto)
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1435,15 @@ async fn reset_paper_state(
     let follower_id = Uuid::parse_str(PAPER_FOLLOWER).expect("sentinel UUID is valid");
 
     let mut tx = pool.begin().await?;
+    let previous_balance: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(
+            (SELECT NULLIF(value, '')::numeric FROM system_settings WHERE key = 'paper_wallet_balance'),
+            1000
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let reset_balance = Decimal::new(1000, 0);
     sqlx::query(
         "INSERT INTO system_settings (key, value, updated_at) VALUES ('paper_wallet_balance', '1000', NOW())
          ON CONFLICT (key) DO UPDATE SET value = '1000', updated_at = NOW()"
@@ -1403,6 +1454,20 @@ async fn reset_paper_state(
         .bind(follower_id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        r#"INSERT INTO paper_wallet_movements (
+               id, follower_account_id, movement_type, amount, balance_after,
+               source_type, source_id, description, payload, created_at
+           ) VALUES ($1, $2, 'reset', $3, $4, 'system', NULL, $5, $6, NOW())"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(follower_id)
+    .bind(reset_balance - previous_balance)
+    .bind(reset_balance)
+    .bind("Paper wallet reset to $1000")
+    .bind(serde_json::json!({ "previous_balance": previous_balance }))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1592,6 +1657,23 @@ pub fn alert_to_dto(r: arbitek_db::AlertRecord) -> AlertDto {
         payload: r.payload,
         created_at: r.created_at,
         acknowledged_at: r.acknowledged_at,
+    }
+}
+
+fn paper_wallet_movement_to_dto(
+    r: arbitek_db::PaperWalletMovementRecord,
+) -> PaperWalletMovementDto {
+    PaperWalletMovementDto {
+        id: r.id,
+        follower_account_id: r.follower_account_id,
+        movement_type: r.movement_type,
+        amount: r.amount.to_f64().unwrap_or(0.0),
+        balance_after: r.balance_after.to_f64().unwrap_or(0.0),
+        source_type: r.source_type,
+        source_id: r.source_id,
+        description: r.description,
+        payload: r.payload,
+        created_at: r.created_at,
     }
 }
 
