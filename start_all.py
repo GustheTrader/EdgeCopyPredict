@@ -17,6 +17,9 @@ import signal
 import subprocess
 import sys
 import time
+import typing
+from urllib.error import URLError
+from urllib.request import urlopen
 
 # ---------------------------------------------------------------------------
 # Configuration — loaded from .env
@@ -71,6 +74,11 @@ ENV = {
     "WORKER__EXECUTION_BATCH_SIZE":      _dotenv.get("EXECUTION_BATCH_SIZE", "10"),
     "WORKER__POLYMARKET_POLL_INTERVAL_SECONDS": _dotenv.get("POLYMARKET_POLL_INTERVAL_SECONDS", "30"),
     "WORKER__KALSHI_POLL_INTERVAL_SECONDS":     _dotenv.get("KALSHI_POLL_INTERVAL_SECONDS", "30"),
+    "WORKER__SIGNAL_NORMALIZE_INTERVAL_MS": _dotenv.get("SIGNAL_NORMALIZE_INTERVAL_MS", "250"),
+    "WORKER__RISK_EVALUATE_INTERVAL_MS":    _dotenv.get("RISK_EVALUATE_INTERVAL_MS", "250"),
+    "WORKER__PAPER_EXECUTION_INTERVAL_MS":  _dotenv.get("PAPER_EXECUTION_INTERVAL_MS", "250"),
+    "WORKER__PNL_REFRESH_INTERVAL_MS":      _dotenv.get("PNL_REFRESH_INTERVAL_MS", "1000"),
+    "WORKER__MAX_TRADE_AGE_SECONDS": _dotenv.get("WORKER_MAX_TRADE_AGE_SECONDS", "900"),
     # Polymarket
     "POLYMARKET__DATA_API_BASE_URL": _dotenv.get("POLY_DATA_API_BASE_URL", "https://data-api.polymarket.com"),
     "POLYMARKET__CLOB_API_BASE_URL": _dotenv.get("POLY_CLOB_API_BASE_URL", "https://clob.polymarket.com"),
@@ -92,9 +100,11 @@ ENV = {
 }
 
 PROCESSES: list[subprocess.Popen] = []
+SERVICES: list[dict] = []
+SHUTTING_DOWN = False
 
 
-def run(cmd: list[str], cwd: str | None = None, env: dict | None = None, **kwargs) -> subprocess.Popen:
+def run(cmd: list[str], cwd: typing.Optional[str] = None, env: typing.Optional[dict] = None, **kwargs) -> subprocess.Popen:
     """Start a background process and track it for cleanup."""
     print(f"[START] {' '.join(cmd)}")
     proc = subprocess.Popen(
@@ -105,6 +115,18 @@ def run(cmd: list[str], cwd: str | None = None, env: dict | None = None, **kwarg
     )
     PROCESSES.append(proc)
     return proc
+
+
+def spawn_service(name: str, cmd: list[str], cwd: typing.Optional[str] = None, env: typing.Optional[dict] = None) -> None:
+    """Start a tracked service that can be restarted if it exits."""
+    proc = run(cmd, cwd=cwd, env=env)
+    SERVICES.append({
+        "name": name,
+        "cmd": cmd,
+        "cwd": cwd or PROJECT_ROOT,
+        "env": env or ENV,
+        "proc": proc,
+    })
 
 
 def wait_for_postgres():
@@ -140,6 +162,25 @@ def wait_for_redis():
     return False
 
 
+def wait_for_api_health(url: str = "http://127.0.0.1:8080/health", timeout_seconds: int = 120):
+    """Wait until the API health endpoint responds successfully."""
+    print("[WAIT] Waiting for API health...")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=5) as response:
+                if 200 <= response.status < 300:
+                    print("[OK] API is healthy")
+                    return True
+        except URLError:
+            pass
+        except Exception:
+            pass
+        time.sleep(2)
+    print("[WARN] API did not report healthy before timeout")
+    return False
+
+
 def run_migrations():
     """Migrations run automatically on API startup via RUN_MIGRATIONS_ON_STARTUP."""
     print("[SKIP] Migrations will be applied by the API on startup")
@@ -165,6 +206,8 @@ def seed_database():
 
 def shutdown(signum, frame):
     """Gracefully terminate all child processes."""
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
     print("\n[SHUTDOWN] Stopping all processes...")
     for proc in PROCESSES:
         try:
@@ -244,30 +287,40 @@ def main():
     # -----------------------------------------------------------------------
     if args.full or args.api:
         print("[START] Starting API server...")
-        run(
+        spawn_service(
+            "api",
             [os.path.join(BIN_DIR, "arbitek-api")],
             cwd=BACKEND_DIR,
             env={**ENV, "WORKER__MODE": "api"},
         )
-        time.sleep(12)
+        wait_for_api_health()
 
     # -----------------------------------------------------------------------
     # Start workers
     # -----------------------------------------------------------------------
     if args.full or args.workers:
+        configured_worker_modes = _dotenv.get("WORKER_MODES", "").strip()
+        live_trading_enabled = _dotenv.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
         worker_modes = [
             "signal-normalize",    # Normalize raw events into copy signals/intents
             "risk-evaluate",
             "paper-execution",
-            "execution-live",
-            "reconcile",
             "pnl-refresh",
+            "execution-live",
             "ingest-polymarket",   # Polymarket master-wallet trade ingestion
-            "ingest-kalshi",       # Kalshi raw event ingestion
         ]
+        if configured_worker_modes:
+            worker_modes = [
+                mode.strip()
+                for mode in configured_worker_modes.split(",")
+                if mode.strip()
+            ]
+        if not live_trading_enabled:
+            worker_modes = [mode for mode in worker_modes if mode != "execution-live"]
         for mode in worker_modes:
             print(f"[START] Starting worker: {mode}")
-            run(
+            spawn_service(
+                mode,
                 [os.path.join(BIN_DIR, "arbitek-worker")],
                 cwd=BACKEND_DIR,
                 env={**ENV, "WORKER__MODE": mode},
@@ -279,7 +332,8 @@ def main():
     # -----------------------------------------------------------------------
     if args.full or args.frontend:
         print("[START] Starting frontend dev server...")
-        run(
+        spawn_service(
+            "frontend",
             ["pnpm", "run", "dev"],
             cwd=FRONTEND_DIR,
             env=os.environ,
@@ -287,6 +341,19 @@ def main():
 
     print("[INFO] All services started. Press Ctrl+C to stop.")
     while True:
+        if not SHUTTING_DOWN:
+            for service in SERVICES:
+                proc = service["proc"]
+                if proc.poll() is not None:
+                    print(
+                        f"[WARN] {service['name']} exited with code {proc.returncode}; restarting..."
+                    )
+                    service["proc"] = subprocess.Popen(
+                        service["cmd"],
+                        cwd=service["cwd"],
+                        env=service["env"],
+                    )
+                    PROCESSES.append(service["proc"])
         time.sleep(1)
 
 
