@@ -14,16 +14,16 @@ export const assetsDir = path.join(distDir, "assets");
 function resolveSourceImport(importPath) {
   const basePath = path.join(srcDir, importPath.slice(2));
   const candidates = [
-    basePath,
     `${basePath}.ts`,
     `${basePath}.tsx`,
     `${basePath}.js`,
     `${basePath}.jsx`,
     path.join(basePath, "index.ts"),
     path.join(basePath, "index.tsx"),
+    basePath,
   ];
 
-  return candidates.find((candidate) => fs.existsSync(candidate));
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
 }
 
 export function sourceAliasPlugin() {

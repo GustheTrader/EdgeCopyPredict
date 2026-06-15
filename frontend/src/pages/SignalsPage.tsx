@@ -14,8 +14,12 @@ function statusClass(status: string) {
   return "bg-gray-800 text-gray-300";
 }
 
+function isBuySide(side: unknown) {
+  return String(side ?? "").toLowerCase() === "buy";
+}
+
 export function SignalsPage() {
-  const { data: restSignals } = useSignalsList();
+  const { data: restSignals } = useSignalsList(200);
   const { data: masters } = useMasters();
   const liveSignals = useSignals();
   const [filters, setFilters] = useState<any>({});
@@ -116,7 +120,7 @@ export function SignalsPage() {
                 <td className="px-4 py-2">
                   <div className="flex flex-col gap-0.5">
                     <span className={`rounded px-1.5 py-0.5 text-xs font-medium w-fit ${
-                      s.side === "buy" ? "bg-green-900/60 text-green-300" : "bg-red-900/60 text-red-300"
+                      isBuySide(s.side) ? "bg-green-900/60 text-green-300" : "bg-red-900/60 text-red-300"
                     }`}>
                       {s.side?.toUpperCase()}
                     </span>

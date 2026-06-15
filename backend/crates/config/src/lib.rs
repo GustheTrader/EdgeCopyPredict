@@ -23,11 +23,24 @@ pub struct AppConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkerConfig {
+    #[serde(default = "default_worker_mode")]
     pub mode: String,
     pub run_migrations_on_startup: bool,
     pub execution_batch_size: i64,
     pub polymarket_poll_interval_seconds: u64,
     pub kalshi_poll_interval_seconds: u64,
+    #[serde(default = "default_signal_normalize_interval_ms")]
+    pub signal_normalize_interval_ms: u64,
+    #[serde(default = "default_risk_evaluate_interval_ms")]
+    pub risk_evaluate_interval_ms: u64,
+    #[serde(default = "default_paper_execution_interval_ms")]
+    pub paper_execution_interval_ms: u64,
+    #[serde(default = "default_pnl_refresh_interval_ms")]
+    pub pnl_refresh_interval_ms: u64,
+    /// Trades older than this (by their on-platform timestamp) are skipped during
+    /// ingest so the historical back-fill isn't replayed as if it were live.
+    #[serde(default = "default_max_trade_age_seconds")]
+    pub max_trade_age_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,6 +69,33 @@ pub struct AuthConfig {
     pub jwt_secret: String,
     pub admin_password: String,
     pub token_expiry_hours: u64,
+}
+
+fn default_worker_mode() -> String {
+    "api".to_owned()
+}
+
+fn default_signal_normalize_interval_ms() -> u64 {
+    250
+}
+
+fn default_risk_evaluate_interval_ms() -> u64 {
+    250
+}
+
+fn default_paper_execution_interval_ms() -> u64 {
+    250
+}
+
+fn default_pnl_refresh_interval_ms() -> u64 {
+    1_000
+}
+
+/// Default recency window for ingest: 5 minutes. Comfortably larger than the
+/// poll intervals (5–30s) so live trades are never missed, but small enough to
+/// exclude the historical back-fill.
+fn default_max_trade_age_seconds() -> u64 {
+    300
 }
 
 impl AppConfig {

@@ -46,6 +46,7 @@ async fn db_first_buy_creates_correct_position() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         Some("Test Market"),
         None,
         "yes",
@@ -103,6 +104,7 @@ async fn db_sell_after_buy_records_correct_realized_pnl() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -117,6 +119,7 @@ async fn db_sell_after_buy_records_correct_realized_pnl() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -169,6 +172,7 @@ async fn db_two_buys_produce_weighted_avg_price() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -184,6 +188,7 @@ async fn db_two_buys_produce_weighted_avg_price() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -232,6 +237,7 @@ async fn db_partial_sell_preserves_avg_price_and_exposure() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -246,6 +252,7 @@ async fn db_partial_sell_preserves_avg_price_and_exposure() {
         follower_id,
         "polymarket",
         market_id,
+        None, // platform_market_id
         None,
         None,
         "yes",
@@ -290,6 +297,84 @@ async fn db_partial_sell_preserves_avg_price_and_exposure() {
     assert!(
         realized_pnl > Decimal::ZERO,
         "partial realisation at profit must be positive"
+    );
+}
+
+#[tokio::test]
+async fn db_settlement_returns_cash_before_zeroing_contracts() {
+    let url = require_db!();
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect postgres");
+    let repo = arbitek_db::PositionRepository::new(pool.clone());
+
+    let follower_id = Uuid::new_v4();
+    let market_id = Uuid::new_v4();
+    let contracts = Decimal::new(5, 0);
+    let avg_price = Decimal::new(30, 2);
+    let settlement_price = Decimal::new(100, 2);
+    let fee = Decimal::new(105, 3);
+
+    repo.upsert(
+        follower_id,
+        "polymarket",
+        market_id,
+        None,
+        Some("Settlement regression"),
+        None,
+        "yes",
+        contracts,
+        avg_price,
+        fee,
+    )
+    .await
+    .expect("upsert buy");
+
+    let position_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM positions WHERE follower_account_id = $1 AND market_id = $2 AND outcome = 'yes'",
+    )
+    .bind(follower_id)
+    .bind(market_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch position id");
+
+    let settlement = repo
+        .settle_resolved_position(position_id, settlement_price, None)
+        .await
+        .expect("settle position")
+        .expect("position should settle");
+
+    assert_eq!(settlement.follower_account_id, follower_id);
+    assert_eq!(
+        settlement.settlement_cash,
+        contracts * settlement_price,
+        "settlement cash must use the pre-close contract count"
+    );
+
+    let row = sqlx::query(
+        "SELECT contracts, realized_pnl, unrealized_pnl, exposure \
+         FROM positions \
+         WHERE id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch settled position");
+
+    let remaining_contracts: Decimal = row.try_get("contracts").unwrap();
+    let realized_pnl: Decimal = row.try_get("realized_pnl").unwrap();
+    let unrealized_pnl: Decimal = row.try_get("unrealized_pnl").unwrap();
+    let exposure: Decimal = row.try_get("exposure").unwrap();
+    let expected_realized = -fee + contracts * (settlement_price - avg_price);
+
+    assert_eq!(remaining_contracts, Decimal::ZERO);
+    assert_eq!(unrealized_pnl, Decimal::ZERO);
+    assert_eq!(exposure, Decimal::ZERO);
+    assert_eq!(realized_pnl, expected_realized);
+    assert!(
+        repo.is_closed_position(follower_id, market_id, "yes")
+            .await
+            .expect("check closed status"),
+        "settled positions must be marked closed for stale paper-intent rejection"
     );
 }
 

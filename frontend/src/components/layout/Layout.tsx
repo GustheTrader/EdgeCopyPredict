@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Outlet, NavLink, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { GlobalKillSwitch } from "./GlobalKillSwitch";
-import { useSignalsList, useAlerts } from "@/hooks/useApi";
+import { useSignalsList, useAlerts, usePaperWalletMovements } from "@/hooks/useApi";
 
 const PAGE_QUERY_KEYS: Record<string, string[][]> = {
   "/":               [["system-status"], ["pnl"], ["positions"], ["alerts"]],
@@ -13,6 +13,7 @@ const PAGE_QUERY_KEYS: Record<string, string[][]> = {
   "/orders":         [["orders"]],
   "/alerts":         [["alerts"]],
   "/trade-history":  [["orders"], ["positions"]],
+  "/calendar":       [["orders"], ["paper-wallet-movements"]],
   "/raw-events":     [["raw-events"]],
   "/market-mappings":[["market-mappings"]],
   "/settings":       [["system-status"]],
@@ -30,13 +31,17 @@ function SidebarBadge({ count }: { count: number }) {
 export function Layout() {
   const qc = useQueryClient();
   const location = useLocation();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth < 768 : false
+  );
 
   const { data: signals } = useSignalsList();
   const { data: alerts } = useAlerts();
+  const { data: walletMovements } = usePaperWalletMovements();
 
-  const pendingSignals = (signals ?? []).filter((s: any) => s.status === "new" || s.status === "pending").length;
-  const unackedAlerts  = (alerts  ?? []).filter((a: any) => !a.acked).length;
+  const pendingSignals   = (signals ?? []).filter((s: any) => s.status === "new" || s.status === "pending").length;
+  const unackedAlerts    = (alerts  ?? []).filter((a: any) => !a.acked).length;
+  const movementCount    = (walletMovements ?? []).length;
 
   // Invalidate data for the page being navigated to so it always loads fresh
   useEffect(() => {
@@ -47,6 +52,7 @@ export function Layout() {
   const navItems = [
     { to: "/",              label: "Dashboard",    abbr: "D"  },
     { to: "/trade-history", label: "Trade History",abbr: "TH" },
+    { to: "/calendar",      label: "Calendar",     abbr: "Ca", badge: movementCount },
     { to: "/signals",       label: "Signals",      abbr: "Si", badge: pendingSignals },
     { to: "/masters",       label: "Masters",      abbr: "M"  },
     { to: "/followers",     label: "Followers",    abbr: "F"  },
@@ -142,7 +148,7 @@ export function Layout() {
       </aside>
 
       {/* Main — key forces full remount on route change, resetting all local state */}
-      <main className="flex-1 overflow-auto p-6">
+      <main className="flex-1 overflow-auto p-4 md:p-6">
         <Outlet key={location.pathname} />
       </main>
     </div>

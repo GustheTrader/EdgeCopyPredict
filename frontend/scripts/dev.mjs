@@ -5,7 +5,6 @@ import path from "node:path";
 import * as esbuild from "esbuild";
 import {
   entryPoint,
-  processCss,
   proxyApiRequest,
   rootDir,
   sourceAliasPlugin,
@@ -37,7 +36,6 @@ async function serveFile(res, filePath) {
 }
 
 async function prepareIndex() {
-  await processCss(devDir);
   await writeIndex(devDir);
 }
 
@@ -55,6 +53,12 @@ const ctx = await esbuild.context({
   loader: {
     ".css": "css",
   },
+  define: {
+    "process.env.NODE_ENV": '"development"',
+    "import.meta.env.VITE_API_BASE_URL": '"http://localhost:8080"',
+    "import.meta.env.VITE_SSE_BASE_URL": '"http://localhost:8080"',
+    "import.meta.env.VITE_PORT": '"3000"',
+  },
   plugins: [
     sourceAliasPlugin(),
     {
@@ -70,8 +74,8 @@ const ctx = await esbuild.context({
   ],
 });
 
-await ctx.watch();
 await ctx.rebuild();
+await ctx.watch();
 
 const server = http.createServer(async (req, res) => {
   const requestUrl = req.url ?? "/";

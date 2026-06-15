@@ -1,15 +1,76 @@
 use anyhow::{Context, Result};
 use arbitek_config::AppConfig;
 use arbitek_db::{
-    connect_worker as connect, CopyIntentRepository, FollowerRepository, MasterRepository,
-    RawEventRecord, RawEventRepository, SignalRecord, SignalRepository,
+    connect_worker as connect, CopyIntentRepository, FollowerRecord, FollowerRepository,
+    MasterRepository, RawEventRecord, RawEventRepository, SignalRecord, SignalRepository,
 };
+use arbitek_domain::copy_config::{opposite_outcome, CopyConfig};
 use arbitek_domain::market_mapping::{default_binary_mappings, MarketMapper};
 use arbitek_platform_kalshi::KalshiDataApiTrade;
 use arbitek_platform_polymarket::PolymarketDataApiTrade;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
-use tracing::{info, warn};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Resolved per-follower copy decision for one master trade, or None to skip this follower.
+struct FollowerCopy {
+    outcome: String,
+    action: &'static str,
+    contracts: Decimal,
+}
+
+/// Apply a follower's copy config to a master trade. Returns None when the trade is
+/// filtered out (behavior/odds/trigger/days-out) or sizes to nothing.
+fn resolve_follower_copy(
+    follower: &FollowerRecord,
+    master_side: &str,
+    master_outcome: &str,
+    entry_price: Decimal,
+    size_contracts: Decimal,
+    master_notional: Decimal,
+    days_out: Option<i64>,
+) -> Option<FollowerCopy> {
+    let cfg = CopyConfig::from_value(&follower.risk_config);
+
+    let act = cfg.behavior_for(master_side)?;
+    if !cfg.passes_odds(entry_price) || !cfg.passes_trigger(master_notional) {
+        return None;
+    }
+    if let (Some(max), Some(d)) = (cfg.max_days_out, days_out) {
+        if d > max {
+            return None;
+        }
+    }
+
+    // Counter-trading flips to the opposite outcome; skip if there is no known opposite.
+    let outcome = if act.invert_outcome {
+        opposite_outcome(master_outcome)?.to_string()
+    } else {
+        master_outcome.to_string()
+    };
+
+    let contracts = cfg.sized_contracts(size_contracts, entry_price, master_notional);
+    if contracts <= Decimal::ZERO {
+        return None;
+    }
+
+    Some(FollowerCopy {
+        outcome,
+        action: act.action,
+        contracts,
+    })
+}
+
+/// Days until a Polymarket market resolves, parsed from the injected end date, if present.
+fn days_until_resolution(trade_raw: &serde_json::Value) -> Option<i64> {
+    trade_raw
+        .get("end_date_iso")
+        .or_else(|| trade_raw.get("endDateIso"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .map(|end| (end - OffsetDateTime::now_utc()).whole_days())
+}
 
 /// Normalize raw events into signals and create copy intents.
 pub async fn run_signal_normalize(config: &AppConfig) -> Result<()> {
@@ -23,11 +84,33 @@ pub async fn run_signal_normalize(config: &AppConfig) -> Result<()> {
 
     info!("starting signal normalization worker");
 
+    let interval =
+        std::time::Duration::from_millis(config.worker.signal_normalize_interval_ms.max(50));
     loop {
-        let events = raw_repo.list_unprocessed(100).await?;
+        let stale_cutoff = raw_event_cutoff(config.worker.max_trade_age_seconds);
+        match raw_repo.mark_stale_before(stale_cutoff).await {
+            Ok(count) if count > 0 => {
+                info!(count, cutoff = %stale_cutoff, "marked stale raw events before normalization");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to mark stale raw events; retrying");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        }
+
+        let events = match raw_repo.list_unprocessed_since(100, stale_cutoff).await {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(error = %e, "failed to list raw events for normalization; retrying");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
         if events.is_empty() {
-            info!("no new raw events pending");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            debug!("no new raw events pending");
+            tokio::time::sleep(interval).await;
             continue;
         }
 
@@ -97,6 +180,16 @@ async fn normalize_event_internal(
     copy_repo: &CopyIntentRepository,
     config: &AppConfig,
 ) -> Result<Option<Uuid>> {
+    if raw_event_is_stale(event, config.worker.max_trade_age_seconds) {
+        warn!(
+            event_id = %event.id,
+            detected_at = %event.detected_at,
+            max_age_seconds = config.worker.max_trade_age_seconds,
+            "skipping stale raw event before signal creation"
+        );
+        return Ok(None);
+    }
+
     match event.platform.as_str() {
         "polymarket" => {
             normalize_polymarket_event(
@@ -119,6 +212,15 @@ async fn normalize_event_internal(
             Ok(None)
         }
     }
+}
+
+fn raw_event_cutoff(max_age_seconds: u64) -> OffsetDateTime {
+    let seconds = max_age_seconds.min(i64::MAX as u64) as i64;
+    OffsetDateTime::now_utc() - time::Duration::seconds(seconds)
+}
+
+fn raw_event_is_stale(event: &RawEventRecord, max_age_seconds: u64) -> bool {
+    event.detected_at < raw_event_cutoff(max_age_seconds)
 }
 
 async fn normalize_polymarket_event(
@@ -228,92 +330,96 @@ async fn normalize_polymarket_event(
         warn!("failed to publish signal normalized event: {}", e);
     }
 
-    // Create copy intents for all active followers.
-    // Polymarket followers always get intents; Kalshi followers only when a mapping exists.
+    // Create copy intents for all active followers, applying each follower's copy config
+    // (buy method / odds / trigger / trade behavior / max-days-out). Polymarket followers
+    // always get a chance; Kalshi followers only when a market mapping exists.
     let followers = follower_repo.list().await?;
-    let action = match side.as_str() {
-        "BUY" => "buy",
-        "SELL" => "sell",
-        _ => "buy",
-    };
+    let days_out = days_until_resolution(&trade.raw);
 
-    // Polymarket followers: always copy using condition_id (mapping optional)
-    let poly_followers: Vec<_> = followers
+    // Polymarket followers: copy using condition_id (mapping optional)
+    for follower in followers
         .iter()
         .filter(|f| f.status == "active" && f.platform == "polymarket")
-        .collect();
-
-    if !poly_followers.is_empty() {
-        info!(
-            count = poly_followers.len(),
-            "creating polymarket copy intents for followers"
-        );
-        for follower in poly_followers {
-            match copy_repo
-                .insert(
-                    follower.id,
-                    "polymarket",
-                    condition_id,
-                    mapping.map(|m| m.id),
-                    &outcome,
-                    action,
-                    size_contracts,
-                    entry_price,
-                    signal_id,
-                )
-                .await
-            {
-                Ok(intent_id) => {
-                    info!(intent_id = %intent_id, follower_id = %follower.id, "created polymarket copy intent");
-                    if let Err(e) =
-                        crate::queue_publish::publish_copy_intent(config, intent_id).await
-                    {
-                        warn!("failed to publish copy intent event: {}", e);
-                    }
+    {
+        let Some(fc) = resolve_follower_copy(
+            follower,
+            &side,
+            &outcome,
+            entry_price,
+            size_contracts,
+            notional,
+            days_out,
+        ) else {
+            info!(follower_id = %follower.id, "skipping polymarket copy intent (filtered by copy config)");
+            continue;
+        };
+        match copy_repo
+            .insert(
+                follower.id,
+                "polymarket",
+                condition_id,
+                mapping.map(|m| m.id),
+                &fc.outcome,
+                fc.action,
+                fc.contracts,
+                entry_price,
+                signal_id,
+            )
+            .await
+        {
+            Ok(intent_id) => {
+                info!(intent_id = %intent_id, follower_id = %follower.id, action = fc.action, "created polymarket copy intent");
+                if let Err(e) = crate::queue_publish::publish_copy_intent(config, intent_id).await {
+                    warn!("failed to publish copy intent event: {}", e);
                 }
-                Err(e) => {
-                    warn!(follower_id = %follower.id, "failed to create polymarket copy intent: {}", e);
-                }
+            }
+            Err(e) => {
+                warn!(follower_id = %follower.id, "failed to create polymarket copy intent: {}", e);
             }
         }
     }
 
     // Kalshi cross-platform copy: only when a mapping exists
     if let Some(ref m) = mapping {
-        let kalshi_outcome = outcome.to_lowercase();
-        let kalshi_followers: Vec<_> = followers
+        for follower in followers
             .iter()
             .filter(|f| f.status == "active" && f.platform == "kalshi")
-            .collect();
-
-        if !kalshi_followers.is_empty() {
-            info!(count = kalshi_followers.len(), kalshi_ticker = %m.kalshi_ticker, "creating cross-platform kalshi copy intents");
-            for follower in kalshi_followers {
-                match copy_repo
-                    .insert(
-                        follower.id,
-                        "kalshi",
-                        &m.kalshi_ticker,
-                        Some(m.id),
-                        &kalshi_outcome,
-                        action,
-                        size_contracts,
-                        entry_price,
-                        signal_id,
-                    )
-                    .await
-                {
-                    Ok(intent_id) => {
-                        info!(intent_id = %intent_id, follower_id = %follower.id, "created cross-platform kalshi copy intent");
-                        if let Err(e) =
-                            crate::queue_publish::publish_copy_intent(config, intent_id).await
-                        {
-                            warn!("failed to publish cross-platform copy intent event: {}", e);
-                        }
+        {
+            let Some(fc) = resolve_follower_copy(
+                follower,
+                &side,
+                &outcome.to_lowercase(),
+                entry_price,
+                size_contracts,
+                notional,
+                days_out,
+            ) else {
+                continue;
+            };
+            match copy_repo
+                .insert(
+                    follower.id,
+                    "kalshi",
+                    &m.kalshi_ticker,
+                    Some(m.id),
+                    &fc.outcome,
+                    fc.action,
+                    fc.contracts,
+                    entry_price,
+                    signal_id,
+                )
+                .await
+            {
+                Ok(intent_id) => {
+                    info!(intent_id = %intent_id, follower_id = %follower.id, "created cross-platform kalshi copy intent");
+                    if let Err(e) =
+                        crate::queue_publish::publish_copy_intent(config, intent_id).await
+                    {
+                        warn!("failed to publish cross-platform copy intent event: {}", e);
                     }
-                    Err(e) => {
-                        warn!(follower_id = %follower.id, "failed to create kalshi copy intent: {}", e);
-                    }
+                }
+                Err(e) => {
+                    warn!(follower_id = %follower.id, "failed to create kalshi copy intent: {}", e);
                 }
             }
         }
@@ -396,7 +502,8 @@ async fn normalize_kalshi_event(
         warn!("failed to publish signal normalized event: {}", e);
     }
 
-    // Create copy intents for all active kalshi followers (only when mapping exists)
+    // Create copy intents for all active kalshi followers (only when mapping exists),
+    // applying each follower's copy config.
     if let Some(ref m) = mapping {
         let followers = follower_repo.list().await?;
         let active_followers: Vec<_> = followers
@@ -410,7 +517,17 @@ async fn normalize_kalshi_event(
         );
 
         for follower in active_followers {
-            let action = side.as_str(); // already "buy" or "sell"
+            let Some(fc) = resolve_follower_copy(
+                &follower,
+                &side,
+                &outcome,
+                entry_price,
+                size_contracts,
+                notional,
+                None,
+            ) else {
+                continue;
+            };
 
             match copy_repo
                 .insert(
@@ -418,9 +535,9 @@ async fn normalize_kalshi_event(
                     "kalshi",
                     market_ticker,
                     Some(m.id),
-                    &outcome,
-                    action,
-                    size_contracts,
+                    &fc.outcome,
+                    fc.action,
+                    fc.contracts,
                     entry_price,
                     signal_id,
                 )
@@ -504,6 +621,33 @@ mod tests {
         let raw = json!({"other": "value"});
         let result = parse_decimal_from_value(&raw, &["price"]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn raw_event_stale_uses_detected_at_window() {
+        let old = OffsetDateTime::now_utc() - time::Duration::seconds(600);
+        let recent = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+
+        let old_event = raw_event_record_with_detected_at(old);
+        let recent_event = raw_event_record_with_detected_at(recent);
+
+        assert!(raw_event_is_stale(&old_event, 300));
+        assert!(!raw_event_is_stale(&recent_event, 300));
+    }
+
+    fn raw_event_record_with_detected_at(detected_at: OffsetDateTime) -> RawEventRecord {
+        RawEventRecord {
+            id: Uuid::new_v4(),
+            platform: "polymarket".to_owned(),
+            source: "test".to_owned(),
+            external_event_id: Uuid::new_v4().to_string(),
+            raw_payload: json!({}),
+            detected_at,
+            processed_at: None,
+            status: "new".to_owned(),
+            source_entity_id: None,
+            source_entity_type: None,
+        }
     }
 }
 

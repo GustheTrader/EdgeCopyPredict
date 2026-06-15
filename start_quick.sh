@@ -12,10 +12,17 @@ if [ ! -f "$BIN/arbitek-api" ] || [ ! -f "$BIN/arbitek-worker" ]; then
   exit 1
 fi
 
-# Load .env into environment
+# Load .env into environment.
+# NOTE: do NOT use `source <(...)` here — bash's process substitution is unreliable
+# with `source` and was silently dropping variables (REDIS_URL ended up UNSET, then
+# `export REDIS_URL="$REDIS_URL"` exported it EMPTY, breaking the Redis client with
+# "Redis URL did not parse"). Source a real temp file, which is deterministic.
 set -a
+ENV_TMP="$(mktemp)"
+grep -v '^#' "$ENV_FILE" | grep '=' | sed 's/\r$//' > "$ENV_TMP"
 # shellcheck disable=SC1090
-source <(grep -v '^#' "$ENV_FILE" | grep '=' | sed 's/\r//')
+source "$ENV_TMP"
+rm -f "$ENV_TMP"
 set +a
 
 export BIND_ADDR="${APP_BIND_ADDR:-127.0.0.1:8080}"

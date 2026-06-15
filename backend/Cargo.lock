@@ -118,9 +118,11 @@ dependencies = [
 name = "arbitek-domain"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]

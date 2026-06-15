@@ -223,6 +223,7 @@ async fn handle_polymarket_order_response(
                     order.follower_account_id,
                     "polymarket",
                     order.market_id.unwrap_or_else(Uuid::nil),
+                    None, // condition_id self-healed by the settlement worker
                     None,
                     None,
                     &order.outcome,
@@ -326,6 +327,7 @@ async fn handle_kalshi_order_response(
                 order.follower_account_id,
                 "kalshi",
                 order.market_id.unwrap_or_else(Uuid::nil),
+                None, // kalshi market identifier resolved via market_mappings
                 None,
                 None,
                 &order.outcome,

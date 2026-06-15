@@ -12,22 +12,22 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
-    connect_pool(database_url, 2).await
+    connect_pool(database_url, 1).await
 }
 
 pub async fn connect_api(database_url: &str) -> Result<PgPool> {
-    connect_pool(database_url, 2).await
+    connect_pool(database_url, 3).await
 }
 
-/// Single-connection pool per worker — prevents concurrent prepared statement name
-/// conflicts (two connections with the same per-connection counter both create
-/// "sqlx_s_0" simultaneously and one fails with "already exists").
+/// Small per-worker pools keep the overall session footprint low while leaving
+/// enough headroom for a worker to hold a transaction and still make a second
+/// query without timing out on acquire.
 pub async fn connect_worker(database_url: &str) -> Result<PgPool> {
-    connect_pool(database_url, 1).await
+    connect_pool(database_url, 3).await
 }
 
 pub async fn connect_execution_worker(database_url: &str) -> Result<PgPool> {
-    connect_pool(database_url, 1).await
+    connect_pool(database_url, 3).await
 }
 
 async fn connect_pool(database_url: &str, max_connections: u32) -> Result<PgPool> {
@@ -170,6 +170,9 @@ pub struct PositionRecord {
     pub follower_account_id: Uuid,
     pub platform: String,
     pub market_id: Uuid,
+    /// Durable platform market identifier (Polymarket condition_id / Kalshi ticker).
+    /// Used by settlement to look up resolution without depending on raw_events.
+    pub platform_market_id: Option<String>,
     pub market_title: Option<String>,
     pub market_status: Option<String>,
     pub close_time: Option<OffsetDateTime>,
@@ -620,6 +623,38 @@ impl OrderRepository {
                 .await?;
         Ok(exists)
     }
+
+    /// Total USDC committed to BUY orders for a follower, used to enforce spend caps.
+    /// Counts filled size at fill price, falling back to requested size at the limit
+    /// price for not-yet-filled orders (conservative). Optionally scoped to a single
+    /// `market_id` (per-market cap) and/or to orders submitted at or after `since`
+    /// (daily cap). NULL filters mean "all".
+    pub async fn buy_spend(
+        &self,
+        follower_account_id: Uuid,
+        market_id: Option<Uuid>,
+        since: Option<OffsetDateTime>,
+    ) -> Result<Decimal> {
+        let total: Decimal = sqlx::query_scalar(
+            r#"SELECT ROUND(COALESCE(SUM(
+                   COALESCE(filled_contracts, requested_contracts)
+                 * COALESCE(avg_fill_price, price_limit)
+               ), 0), 8)::numeric(30, 8)
+               FROM orders
+               WHERE follower_account_id = $1
+                 AND side = 'buy'
+                 AND status NOT IN ('rejected', 'failed', 'cancelled')
+                 AND ($2::uuid IS NULL OR market_id = $2)
+                 AND ($3::timestamptz IS NULL OR submitted_at >= $3)"#,
+        )
+        .persistent(false)
+        .bind(follower_account_id)
+        .bind(market_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total)
+    }
 }
 
 #[derive(Clone)]
@@ -721,13 +756,13 @@ impl PositionRepository {
         &self,
         filter: &PositionFilter<'_>,
     ) -> Result<PaginatedResult<PositionRecord>> {
-        let limit = filter.per_page.max(1).min(200) as i64;
+        let limit = filter.per_page.max(1).min(1000) as i64;
         let offset = ((filter.page.saturating_sub(1)) as i64) * limit;
 
         let open_only = filter.open_only.unwrap_or(false);
         let rows = sqlx::query(
-            r#"select id, follower_account_id, platform, market_id, market_title,
-                      market_status, close_time, outcome, contracts, avg_price,
+            r#"select id, follower_account_id, platform, market_id, platform_market_id,
+                      market_title, market_status, close_time, outcome, contracts, avg_price,
                       realized_pnl, unrealized_pnl, exposure, updated_at
                from positions
                where ($3::uuid is null or follower_account_id = $3)
@@ -769,11 +804,13 @@ impl PositionRepository {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
         follower_account_id: Uuid,
         platform: &str,
         market_id: Uuid,
+        platform_market_id: Option<&str>,
         market_title: Option<&str>,
         market_status: Option<&str>,
         outcome: &str,
@@ -815,6 +852,7 @@ impl PositionRepository {
                 END,
                 market_title = COALESCE($4, market_title),
                 market_status = COALESCE($5, market_status),
+                platform_market_id = COALESCE($9, platform_market_id),
                 updated_at = NOW()
             WHERE follower_account_id = $6 AND market_id = $7 AND outcome = $8"#
         )
@@ -826,6 +864,7 @@ impl PositionRepository {
         .bind(follower_account_id)
         .bind(market_id)
         .bind(outcome)
+        .bind(platform_market_id)
         .execute(&self.pool)
         .await?;
 
@@ -836,15 +875,16 @@ impl PositionRepository {
             let is_buy = contracts_delta > Decimal::ZERO;
             sqlx::query(
                 r#"INSERT INTO positions (
-                    id, follower_account_id, platform, market_id, market_title,
-                    market_status, outcome, contracts, avg_price, realized_pnl,
+                    id, follower_account_id, platform, market_id, platform_market_id,
+                    market_title, market_status, outcome, contracts, avg_price, realized_pnl,
                     unrealized_pnl, exposure, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())"#,
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())"#,
             )
             .bind(Uuid::new_v4())
             .bind(follower_account_id)
             .bind(platform)
             .bind(market_id)
+            .bind(platform_market_id)
             .bind(market_title)
             .bind(market_status)
             .bind(outcome)
@@ -887,17 +927,28 @@ impl PositionRepository {
         close_time: Option<OffsetDateTime>,
     ) -> Result<Option<SettledPositionRecord>> {
         let row = sqlx::query(
-            r#"UPDATE positions SET
-                   realized_pnl = realized_pnl + contracts * ($1 - avg_price),
-                   contracts = 0,
-                   unrealized_pnl = 0,
-                   exposure = 0,
-                   market_status = 'closed',
-                   close_time = COALESCE($2, NOW()),
-                   updated_at = NOW()
-               WHERE id = $3
-                 AND contracts <> 0
-               RETURNING follower_account_id, contracts * $1 AS settlement_cash"#,
+            r#"WITH current_position AS (
+                   SELECT follower_account_id, contracts, avg_price
+                   FROM positions
+                   WHERE id = $3
+                     AND contracts <> 0
+               ),
+               updated AS (
+                   UPDATE positions p SET
+                       realized_pnl = p.realized_pnl + current_position.contracts * ($1 - current_position.avg_price),
+                       contracts = 0,
+                       unrealized_pnl = 0,
+                       exposure = 0,
+                       market_status = 'closed',
+                       close_time = COALESCE($2, NOW()),
+                       updated_at = NOW()
+                   FROM current_position
+                   WHERE p.id = $3
+                   RETURNING current_position.follower_account_id,
+                             current_position.contracts * $1 AS settlement_cash
+               )
+               SELECT follower_account_id, settlement_cash
+               FROM updated"#,
         )
         .persistent(false)
         .bind(settlement_price)
@@ -911,10 +962,67 @@ impl PositionRepository {
         }))
     }
 
+    /// Current open contracts for a (follower, market, outcome). Returns 0 when there
+    /// is no position row. Used to clamp copy sells so they never exceed the holding.
+    pub async fn open_contracts(
+        &self,
+        follower_account_id: Uuid,
+        market_id: Uuid,
+        outcome: &str,
+    ) -> Result<Decimal> {
+        let contracts: Option<Decimal> = sqlx::query_scalar(
+            r#"SELECT contracts FROM positions
+               WHERE follower_account_id = $1 AND market_id = $2 AND outcome = $3"#,
+        )
+        .persistent(false)
+        .bind(follower_account_id)
+        .bind(market_id)
+        .bind(outcome)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(contracts.unwrap_or(Decimal::ZERO))
+    }
+
+    pub async fn is_closed_position(
+        &self,
+        follower_account_id: Uuid,
+        market_id: Uuid,
+        outcome: &str,
+    ) -> Result<bool> {
+        let is_closed: Option<bool> = sqlx::query_scalar(
+            r#"SELECT COALESCE(market_status = 'closed', false)
+               FROM positions
+               WHERE follower_account_id = $1 AND market_id = $2 AND outcome = $3"#,
+        )
+        .persistent(false)
+        .bind(follower_account_id)
+        .bind(market_id)
+        .bind(outcome)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(is_closed.unwrap_or(false))
+    }
+
+    /// Persist the recovered platform market identifier on a position so future
+    /// settlement passes don't depend on raw_events still being present. Only writes
+    /// when the column is currently NULL (self-healing, idempotent).
+    pub async fn set_platform_market_id(&self, id: Uuid, platform_market_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE positions SET platform_market_id = $1
+               WHERE id = $2 AND platform_market_id IS NULL"#,
+        )
+        .persistent(false)
+        .bind(platform_market_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_open(&self, limit: i64) -> Result<Vec<PositionRecord>> {
         let rows = sqlx::query(
-            r#"SELECT id, follower_account_id, platform, market_id, market_title,
-                      market_status, close_time, outcome, contracts, avg_price,
+            r#"SELECT id, follower_account_id, platform, market_id, platform_market_id,
+                      market_title, market_status, close_time, outcome, contracts, avg_price,
                       realized_pnl, unrealized_pnl, exposure, updated_at
                FROM positions WHERE contracts <> 0 ORDER BY updated_at DESC LIMIT $1"#,
         )
@@ -1011,6 +1119,38 @@ impl AlertRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Insert an alert only if there is no existing OPEN alert with the same type and
+    /// entity. Prevents a recurring worker condition (e.g. a position that cannot be
+    /// settled) from flooding the alerts table on every poll cycle. Returns true if a
+    /// new alert was created.
+    pub async fn insert_if_absent(
+        &self,
+        severity: &str,
+        alert_type: &str,
+        message: &str,
+        entity_type: Option<&str>,
+        entity_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"INSERT INTO alerts (id, severity, type, status, message, entity_type, entity_id)
+               SELECT $1, $2, $3, 'open', $4, $5, $6
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM alerts
+                   WHERE type = $3 AND status = 'open'
+                     AND entity_id IS NOT DISTINCT FROM $6
+               )"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(severity)
+        .bind(alert_type)
+        .bind(message)
+        .bind(entity_type)
+        .bind(entity_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -1131,6 +1271,7 @@ fn position_from_row(row: sqlx::postgres::PgRow) -> PositionRecord {
         follower_account_id: row.try_get("follower_account_id").unwrap_or_default(),
         platform: row.try_get("platform").unwrap_or_default(),
         market_id: row.try_get("market_id").unwrap_or_default(),
+        platform_market_id: row.try_get("platform_market_id").ok(),
         market_title: row.try_get("market_title").ok(),
         market_status: row.try_get("market_status").ok(),
         close_time: row.try_get("close_time").ok(),
@@ -1178,6 +1319,7 @@ pub struct CopyIntentForExecution {
     pub action: String,
     pub target_contracts: Decimal,
     pub price_limit: Decimal,
+    pub created_at: OffsetDateTime,
     pub market_title: Option<String>,
 }
 
@@ -1199,6 +1341,7 @@ impl CopyIntentRepository {
         let rows = sqlx::query(
             r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
                       ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      ci.created_at,
                       s.market_title
                FROM copy_intents ci
                LEFT JOIN signals s ON s.id = ci.signal_id
@@ -1222,6 +1365,7 @@ impl CopyIntentRepository {
         let rows = sqlx::query(
             r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
                       ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      ci.created_at,
                       s.market_title
                FROM copy_intents ci
                LEFT JOIN signals s ON s.id = ci.signal_id
@@ -1244,11 +1388,12 @@ impl CopyIntentRepository {
         let rows = sqlx::query(
             r#"SELECT ci.id, ci.follower_account_id, ci.platform, ci.signal_platform_market_id,
                       ci.market_id, ci.outcome, ci.action, ci.target_contracts, ci.price_limit,
+                      ci.created_at,
                       s.market_title
                FROM copy_intents ci
                LEFT JOIN signals s ON s.id = ci.signal_id
                WHERE ci.status = 'pending'
-               ORDER BY ci.created_at ASC
+               ORDER BY ci.created_at DESC
                LIMIT $1"#,
         )
         .bind(limit)
@@ -1313,6 +1458,9 @@ fn copy_intent_from_row(r: sqlx::postgres::PgRow) -> CopyIntentForExecution {
         action: r.try_get("action").unwrap_or_default(),
         target_contracts: r.try_get("target_contracts").unwrap_or_default(),
         price_limit: r.try_get("price_limit").unwrap_or_default(),
+        created_at: r
+            .try_get("created_at")
+            .unwrap_or_else(|_| OffsetDateTime::now_utc()),
         market_title: r.try_get("market_title").ok().flatten(),
     }
 }
@@ -1345,7 +1493,10 @@ impl OrderRepository {
         .bind(intent.follower_account_id)
         .bind(output.platform_order_id)
         .bind(format!("live:{}", order_id))
-        .bind(intent.market_id)
+        .bind(arbitek_domain::stable_market_id(
+            intent.market_id,
+            &intent.signal_platform_market_id,
+        ))
         .bind(&intent.outcome)
         .bind(&intent.action)
         .bind(intent.price_limit)
@@ -1385,7 +1536,10 @@ impl OrderRepository {
         .bind(&intent.platform)
         .bind(intent.follower_account_id)
         .bind(format!("paper:{}", order_id))
-        .bind(intent.market_id)
+        .bind(arbitek_domain::stable_market_id(
+            intent.market_id,
+            &intent.signal_platform_market_id,
+        ))
         .bind(&intent.outcome)
         .bind(&intent.action)
         .bind(intent.price_limit)
@@ -1452,6 +1606,38 @@ impl RawEventRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(raw_event_from_row).collect())
+    }
+
+    pub async fn list_unprocessed_since(
+        &self,
+        limit: i64,
+        cutoff: OffsetDateTime,
+    ) -> Result<Vec<RawEventRecord>> {
+        let rows = sqlx::query(
+            r#"SELECT id, platform, source, external_event_id, raw_payload, detected_at, processed_at, status, source_entity_id, source_entity_type
+               FROM raw_events
+               WHERE status = 'new' AND detected_at >= $2
+               ORDER BY detected_at DESC
+               LIMIT $1"#,
+        )
+        .bind(limit)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut records: Vec<_> = rows.into_iter().map(raw_event_from_row).collect();
+        records.reverse();
+        Ok(records)
+    }
+
+    pub async fn mark_stale_before(&self, cutoff: OffsetDateTime) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE raw_events SET status = 'stale', processed_at = NOW() WHERE status = 'new' AND detected_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn mark_processed(&self, id: Uuid) -> Result<()> {
@@ -1740,7 +1926,7 @@ impl PaperWalletMovementRepository {
                LIMIT $2"#,
         )
         .bind(follower_account_id)
-        .bind(limit.max(1).min(500))
+        .bind(limit.max(1).min(1000))
         .fetch_all(&self.pool)
         .await?;
 

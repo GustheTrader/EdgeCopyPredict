@@ -1,8 +1,8 @@
 use anyhow::Result;
 use arbitek_config::AppConfig;
 use arbitek_db::{
-    connect_worker as connect, MarketMappingRecord, MarketMappingRepository, PositionRepository,
-    RawEventRepository, SystemSettingsRepository,
+    connect_worker as connect, AlertRepository, MarketMappingRecord, MarketMappingRepository,
+    PositionRepository, RawEventRepository, SystemSettingsRepository,
 };
 use arbitek_platform_kalshi::KalshiDataApiClient;
 use arbitek_platform_polymarket::clob::PolymarketClobClient;
@@ -10,25 +10,37 @@ use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde_json::json;
 use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const PAPER_FOLLOWER_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
 /// Refresh unrealized PnL for all open positions by fetching current market prices.
 pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
+    run_pnl_refresh_inner(config, false).await
+}
+
+/// Run a single pnl-refresh + settlement pass and return. Used as an on-demand
+/// "settle/backfill sweep" (worker mode `pnl-refresh-once`): it backfills durable
+/// condition_ids, settles any open position whose market has resolved, and alerts on
+/// positions that cannot be settled.
+pub async fn run_pnl_refresh_once(config: &AppConfig) -> Result<()> {
+    run_pnl_refresh_inner(config, true).await
+}
+
+async fn run_pnl_refresh_inner(config: &AppConfig, run_once: bool) -> Result<()> {
     let pool = connect(&config.database_url).await?;
     let position_repo = PositionRepository::new(pool.clone());
     let mapping_repo = MarketMappingRepository::new(pool.clone());
     let raw_repo = RawEventRepository::new(pool.clone());
+    let alert_repo = AlertRepository::new(pool.clone());
     let settings_repo = SystemSettingsRepository::new(pool.clone());
     let paper_follower_id = Uuid::parse_str(PAPER_FOLLOWER_ID).expect("paper follower UUID");
 
     let kalshi_client = KalshiDataApiClient::new(&config.kalshi.rest_api_base_url, None);
     let poly_clob_client = PolymarketClobClient::new(&config.polymarket.clob_api_base_url);
 
-    let interval =
-        std::time::Duration::from_secs(config.worker.polymarket_poll_interval_seconds.max(10));
+    let interval = std::time::Duration::from_millis(config.worker.pnl_refresh_interval_ms.max(250));
 
     info!("starting pnl refresh worker");
 
@@ -37,12 +49,19 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             Ok(p) => p,
             Err(e) => {
                 error!(error = %e, "failed to list open positions");
+                if run_once {
+                    return Err(e);
+                }
                 tokio::time::sleep(interval).await;
                 continue;
             }
         };
 
         if positions.is_empty() {
+            if run_once {
+                info!("no open positions to settle");
+                return Ok(());
+            }
             tokio::time::sleep(interval).await;
             continue;
         }
@@ -52,6 +71,9 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             Ok(ms) => ms.into_iter().map(|m| (m.id, m)).collect(),
             Err(e) => {
                 error!(error = %e, "failed to fetch market mappings");
+                if run_once {
+                    return Err(e);
+                }
                 tokio::time::sleep(interval).await;
                 continue;
             }
@@ -61,35 +83,86 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             .iter()
             .filter(|p| mappings.contains_key(&p.market_id))
             .count();
-        info!(
+        debug!(
             total = positions.len(),
             mapped = mapped_count,
             "refreshing unrealized pnl"
         );
 
         for pos in &positions {
-            // Resolve condition_id: either from a market mapping or by recovering it
-            // from raw_events for unmapped positions (no market_mappings entry).
-            let poly_condition_id: Option<String> = if let Some(m) = mappings.get(&pos.market_id) {
-                Some(m.polymarket_condition_id.clone())
-            } else if pos.platform == "polymarket" {
-                match raw_repo
-                    .find_condition_id_by_market_uuid(pos.market_id)
-                    .await
+            // Resolve the Polymarket condition_id, most-durable source first:
+            //   1. the platform_market_id stored on the position (set at execution time
+            //      or self-healed on a previous pass) — survives raw_events pruning;
+            //   2. a market_mapping entry;
+            //   3. recovery from raw_events (then persisted back so it never needs the
+            //      raw_event again).
+            let poly_condition_id: Option<String> = if pos.platform == "polymarket" {
+                if let Some(cid) = pos
+                    .platform_market_id
+                    .clone()
+                    .filter(|c| c.starts_with("0x"))
                 {
-                    Ok(Some(cid)) => Some(cid),
-                    Ok(None) => {
-                        warn!(market_id = %pos.market_id, outcome = %pos.outcome, "no condition_id in raw_events for this market — skipping pnl refresh");
-                        None
-                    }
-                    Err(e) => {
-                        warn!(position_id = %pos.id, error = %e, "failed to look up condition_id");
-                        None
+                    Some(cid)
+                } else if let Some(m) = mappings.get(&pos.market_id) {
+                    Some(m.polymarket_condition_id.clone())
+                } else {
+                    match raw_repo
+                        .find_condition_id_by_market_uuid(pos.market_id)
+                        .await
+                    {
+                        Ok(Some(cid)) => {
+                            // Self-heal: persist so future passes don't depend on raw_events.
+                            if let Err(e) = position_repo.set_platform_market_id(pos.id, &cid).await
+                            {
+                                warn!(position_id = %pos.id, error = %e, "failed to persist recovered condition_id");
+                            }
+                            Some(cid)
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!(position_id = %pos.id, error = %e, "failed to look up condition_id");
+                            None
+                        }
                     }
                 }
+            } else if let Some(m) = mappings.get(&pos.market_id) {
+                Some(m.polymarket_condition_id.clone())
             } else {
                 None
             };
+
+            // Never silently skip an open Polymarket position we cannot settle — raise a
+            // (deduplicated) alert so the operator sees it instead of it sitting open forever.
+            if pos.platform == "polymarket" && poly_condition_id.is_none() {
+                let message = format!(
+                    "Open Polymarket position {} ({} contracts, outcome '{}', market '{}') cannot be settled: \
+                     no condition_id is recoverable (missing platform_market_id, market mapping, and raw_event). \
+                     It will remain open until resolved manually.",
+                    pos.id,
+                    pos.contracts,
+                    pos.outcome,
+                    pos.market_title.as_deref().unwrap_or("unknown"),
+                );
+                match alert_repo
+                    .insert_if_absent(
+                        "critical",
+                        "unsettleable_position",
+                        &message,
+                        Some("position"),
+                        Some(pos.id),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        warn!(position_id = %pos.id, "raised unsettleable_position alert — cannot recover condition_id")
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(position_id = %pos.id, error = %e, "failed to raise unsettleable_position alert")
+                    }
+                }
+                continue;
+            }
 
             let current_price = match pos.platform.as_str() {
                 "kalshi" => {
@@ -191,6 +264,20 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
                                         outcome = %pos.outcome,
                                         "closed polymarket market has no settlement price"
                                     );
+                                    let message = format!(
+                                        "Polymarket market for position {} (outcome '{}') is closed but \
+                                         exposes no settlement price for that outcome — cannot auto-settle.",
+                                        pos.id, pos.outcome,
+                                    );
+                                    let _ = alert_repo
+                                        .insert_if_absent(
+                                            "critical",
+                                            "settlement_price_missing",
+                                            &message,
+                                            Some("position"),
+                                            Some(pos.id),
+                                        )
+                                        .await;
                                 }
                                 None
                             } else if let Some(price) =
@@ -237,7 +324,7 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             if let Some(price) = current_price {
                 match position_repo.refresh_unrealized_pnl(pos.id, price).await {
                     Ok(true) => {
-                        info!(position_id = %pos.id, price = %price, "refreshed unrealized pnl");
+                        debug!(position_id = %pos.id, price = %price, "refreshed unrealized pnl");
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -247,6 +334,10 @@ pub async fn run_pnl_refresh(config: &AppConfig) -> Result<()> {
             }
         }
 
+        if run_once {
+            info!("settlement sweep complete");
+            return Ok(());
+        }
         tokio::time::sleep(interval).await;
     }
 }

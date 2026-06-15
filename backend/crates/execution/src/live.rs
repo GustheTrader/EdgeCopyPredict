@@ -18,6 +18,9 @@ pub struct LiveExecutionInput {
     pub side: String,
     pub target_contracts: Decimal,
     pub price_limit: Decimal,
+    /// Slippage tolerance as a fraction of price (e.g. 0.10 = 10%). The follower's
+    /// configured `slippage_pct` from their copy config.
+    pub slippage: Decimal,
     pub client_order_id: String,
 }
 
@@ -55,14 +58,13 @@ pub async fn execute_kalshi(
         _ => (side.clone(), input.price_limit),
     };
 
-    // Apply slippage cap per PRD default (3 cents):
-    //   bid orders: willing to pay up to 3¢ above master price → cap at 0.97
-    //   ask orders: willing to receive 3¢ below master price   → floor at 0.03
-    let max_slippage = Decimal::new(3, 2);
+    // Apply the follower's configured slippage tolerance as a fraction of price:
+    //   bid orders: willing to pay up to slippage% above master price (cap 0.99)
+    //   ask orders: willing to receive slippage% below master price  (floor 0.01)
     let order_price = if kalshi_side == "bid" {
-        (raw_price + max_slippage).min(Decimal::new(97, 2))
+        (raw_price * (Decimal::ONE + input.slippage)).min(Decimal::new(99, 2))
     } else {
-        (raw_price - max_slippage).max(Decimal::new(3, 2))
+        (raw_price * (Decimal::ONE - input.slippage)).max(Decimal::new(1, 2))
     };
 
     let request = KalshiOrderRequest {
@@ -103,14 +105,13 @@ pub async fn execute_polymarket_clob(
     client: &PolymarketClobClient,
     token_id: &str,
 ) -> Result<LiveExecutionOutput> {
-    // Apply slippage cap per PRD default (3 cents):
-    //   buy: willing to pay up to 3¢ above master price → cap at 0.97
-    //   sell: willing to accept 3¢ below master price   → floor at 0.03
-    let max_slippage = Decimal::new(3, 2);
+    // Apply the follower's configured slippage tolerance as a fraction of price:
+    //   buy: willing to pay up to slippage% above master price (cap 0.99)
+    //   sell: willing to accept slippage% below master price   (floor 0.01)
     let order_price = if input.side.to_lowercase() == "buy" {
-        (input.price_limit + max_slippage).min(Decimal::new(97, 2))
+        (input.price_limit * (Decimal::ONE + input.slippage)).min(Decimal::new(99, 2))
     } else {
-        (input.price_limit - max_slippage).max(Decimal::new(3, 2))
+        (input.price_limit * (Decimal::ONE - input.slippage)).max(Decimal::new(1, 2))
     };
 
     let order = ClobOrder {

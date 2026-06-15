@@ -1,13 +1,14 @@
-use crate::{AlertDto, AppState, SignalDto, SystemStatusDto};
+use crate::{build_system_status_dto, AlertDto, AppState, SignalDto, SystemStatusDto};
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::{self, Stream};
 use rust_decimal::prelude::ToPrimitive;
 use serde_json;
 use sqlx::Row;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::time::Duration;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tracing::{error, warn};
@@ -19,14 +20,31 @@ use tracing::{error, warn};
 pub async fn sse_activity_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let backlog = match recent_signal_snapshot(&state.pool, 20).await {
+        Ok(signals) => signals,
+        Err(err) => {
+            warn!(error = %err, "failed to load activity SSE initial signal snapshot");
+            VecDeque::new()
+        }
+    };
     let rx = state.activity_tx.subscribe();
-    let stream = stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Ok(signal) => {
-                let payload = serde_json::to_string(&signal).unwrap_or_default();
-                Some((Ok(Event::default().data(payload)), rx))
+    let stream = stream::unfold((backlog, rx), |(mut backlog, mut rx)| async {
+        if let Some(signal) = backlog.pop_front() {
+            let payload = serde_json::to_string(&signal).unwrap_or_default();
+            return Some((Ok(Event::default().data(payload)), (backlog, rx)));
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(signal) => {
+                    let payload = serde_json::to_string(&signal).unwrap_or_default();
+                    return Some((Ok(Event::default().data(payload)), (backlog, rx)));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "activity SSE subscriber lagged; continuing stream");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
             }
-            Err(_) => None,
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -37,12 +55,17 @@ pub async fn sse_alerts_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.alerts_tx.subscribe();
     let stream = stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Ok(alert) => {
-                let payload = serde_json::to_string(&alert).unwrap_or_default();
-                Some((Ok(Event::default().data(payload)), rx))
+        loop {
+            match rx.recv().await {
+                Ok(alert) => {
+                    let payload = serde_json::to_string(&alert).unwrap_or_default();
+                    return Some((Ok(Event::default().data(payload)), rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "alerts SSE subscriber lagged; continuing stream");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
             }
-            Err(_) => None,
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -53,12 +76,17 @@ pub async fn sse_system_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.system_tx.subscribe();
     let stream = stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Ok(status) => {
-                let payload = serde_json::to_string(&status).unwrap_or_default();
-                Some((Ok(Event::default().data(payload)), rx))
+        loop {
+            match rx.recv().await {
+                Ok(status) => {
+                    let payload = serde_json::to_string(&status).unwrap_or_default();
+                    return Some((Ok(Event::default().data(payload)), rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "system SSE subscriber lagged; continuing stream");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
             }
-            Err(_) => None,
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -67,6 +95,35 @@ pub async fn sse_system_handler(
 // ---------------------------------------------------------------------------
 // Background broadcast tasks (raw SQL to avoid modifying db crate)
 // ---------------------------------------------------------------------------
+
+async fn recent_signal_snapshot(
+    pool: &sqlx::PgPool,
+    limit: i64,
+) -> Result<VecDeque<SignalDto>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT s.id, s.platform, s.master_id, s.market_id, s.outcome, s.side,
+                  s.position_effect, s.size_contracts, s.notional, s.currency,
+                  s.entry_price, s.event_timestamp, s.detected_at,
+                  s.confidence_score, s.status, s.market_title,
+                  m.wallet_address AS master_wallet
+           FROM signals s
+           LEFT JOIN masters m ON m.id = s.master_id
+           ORDER BY s.detected_at DESC
+           LIMIT $1"#,
+    )
+    .bind(limit.max(1).min(200))
+    .fetch_all(pool)
+    .await?;
+
+    let mut signals = VecDeque::with_capacity(rows.len());
+    for row in rows {
+        match signal_row_to_dto(row) {
+            Ok(signal) => signals.push_back(signal),
+            Err(err) => warn!(error = %err, "failed to convert activity SSE snapshot row"),
+        }
+    }
+    Ok(signals)
+}
 
 pub async fn broadcast_activity(pool: sqlx::PgPool, tx: broadcast::Sender<SignalDto>) {
     let mut last_check = OffsetDateTime::now_utc() - Duration::from_secs(60);
@@ -85,7 +142,7 @@ pub async fn broadcast_activity(pool: sqlx::PgPool, tx: broadcast::Sender<Signal
                ORDER BY s.detected_at ASC LIMIT $2"#,
         )
         .bind(last_check)
-        .bind(50i64)
+        .bind(200i64)
         .fetch_all(&pool)
         .await;
 
@@ -98,9 +155,14 @@ pub async fn broadcast_activity(pool: sqlx::PgPool, tx: broadcast::Sender<Signal
                         .max()
                         .unwrap_or(last_check);
                     for row in records {
-                        if let Ok(dto) = signal_row_to_dto(row) {
-                            if tx.send(dto).is_err() {
-                                warn!("activity broadcast channel has no receivers");
+                        match signal_row_to_dto(row) {
+                            Ok(dto) => {
+                                if tx.send(dto).is_err() {
+                                    warn!("activity broadcast channel has no receivers");
+                                }
+                            }
+                            Err(err) => {
+                                warn!(error = %err, "failed to convert activity broadcast row");
                             }
                         }
                     }
@@ -157,49 +219,18 @@ pub async fn broadcast_system(
     config: std::sync::Arc<arbitek_config::AppConfig>,
     tx: broadcast::Sender<SystemStatusDto>,
 ) {
-    let settings = arbitek_db::SystemSettingsRepository::new(pool.clone());
     loop {
         sleep(Duration::from_secs(10)).await;
 
-        let live_trading = settings
-            .get_bool("live_trading_enabled", false)
-            .await
-            .unwrap_or(false);
-        let kalshi_exec = settings
-            .get_bool("kalshi_execution_enabled", false)
-            .await
-            .unwrap_or(false);
-        let paper_balance = settings
-            .get_decimal("paper_wallet_balance", rust_decimal::Decimal::new(1000, 0))
-            .await
-            .unwrap_or(rust_decimal::Decimal::new(1000, 0))
-            .to_f64()
-            .unwrap_or(1000.0);
-
-        let open_count: i64 =
-            sqlx::query_scalar("select count(*) as n from alerts where status = 'open'")
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
-
-        let last_ts: Option<OffsetDateTime> =
-            sqlx::query("select max(detected_at) as ts from signals")
-                .fetch_one(&pool)
-                .await
-                .ok()
-                .and_then(|row| row.try_get("ts").ok());
-
-        let dto = SystemStatusDto {
-            live_trading_enabled: live_trading,
-            kalshi_execution_enabled: kalshi_exec,
-            paper_wallet_balance: paper_balance,
-            worker_mode: config.worker.mode.clone(),
-            open_alert_count: open_count,
-            last_signal_at: last_ts.and_then(|dt| dt.format(&Rfc3339).ok()),
-        };
-
-        if tx.send(dto).is_err() {
-            warn!("system broadcast channel has no receivers");
+        match build_system_status_dto(&pool, &config.worker.mode).await {
+            Ok(dto) => {
+                if tx.send(dto).is_err() {
+                    warn!("system broadcast channel has no receivers");
+                }
+            }
+            Err(err) => {
+                warn!(error = %err.inner, "failed to build system status broadcast");
+            }
         }
     }
 }
@@ -339,9 +370,14 @@ pub async fn broadcast_from_redis(
 
                         if let Some(sid) = signal_id {
                             let row = sqlx::query(
-                                r#"select id,platform,master_id,market_id,outcome,side,position_effect,
-                                 size_contracts,notional,currency,entry_price,event_timestamp,detected_at,
-                                 confidence_score,status,market_title from signals where id = $1"#
+                                r#"SELECT s.id, s.platform, s.master_id, s.market_id, s.outcome, s.side,
+                                          s.position_effect, s.size_contracts, s.notional, s.currency,
+                                          s.entry_price, s.event_timestamp, s.detected_at,
+                                          s.confidence_score, s.status, s.market_title,
+                                          m.wallet_address AS master_wallet
+                                   FROM signals s
+                                   LEFT JOIN masters m ON m.id = s.master_id
+                                   WHERE s.id = $1"#,
                             )
                             .bind(sid)
                             .fetch_optional(&pool)

@@ -16,6 +16,7 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { RawEventsPage } from "@/pages/RawEventsPage";
 import { MarketMappingsPage } from "@/pages/MarketMappingsPage";
 import { TradeHistoryPage } from "@/pages/TradeHistoryPage";
+import { CalendarPage } from "@/pages/CalendarPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -50,6 +51,7 @@ function App() {
           >
             <Route path="/" element={<Dashboard />} />
             <Route path="/trade-history" element={<TradeHistoryPage />} />
+            <Route path="/calendar" element={<CalendarPage />} />
             <Route path="/signals" element={<SignalsPage />} />
             <Route path="/masters" element={<MastersPage />} />
             <Route path="/followers" element={<FollowersPage />} />

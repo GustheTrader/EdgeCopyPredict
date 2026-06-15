@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 export interface SignalDto {
   id: string;
@@ -20,25 +21,47 @@ export interface SignalDto {
   status: string;
 }
 
+function signalTime(signal: SignalDto) {
+  const ts = new Date(signal.detected_at).getTime();
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function mergeSignal(signal: SignalDto, existing: SignalDto[] = []) {
+  const map = new Map<string, SignalDto>();
+  map.set(signal.id, signal);
+  for (const item of existing) {
+    if (!map.has(item.id)) map.set(item.id, item);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => signalTime(b) - signalTime(a))
+    .slice(0, 200);
+}
+
 export function useSignals() {
   const [signals, setSignals] = useState<SignalDto[]>([]);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
-    const sseBase = import.meta.env.VITE_SSE_BASE_URL ?? "";
+    const sseBase = (import.meta.env.VITE_SSE_BASE_URL ?? "").replace(/\/$/, "");
     const source = new EventSource(`${sseBase}/sse/activity`);
     source.onmessage = (event) => {
       try {
         const signal: SignalDto = JSON.parse(event.data);
-        setSignals((prev) => [signal, ...prev].slice(0, 200));
+        setSignals((prev) => mergeSignal(signal, prev));
+        queryClient.setQueriesData<SignalDto[]>(
+          { queryKey: ["signals"] },
+          (old) => mergeSignal(signal, old ?? []),
+        );
+        queryClient.invalidateQueries({ queryKey: ["system-status"] });
       } catch {
         /* ignore malformed */
       }
     };
     source.onerror = () => {
-      /* auto-reconnects */
+      queryClient.invalidateQueries({ queryKey: ["signals"] });
     };
     return () => source.close();
-  }, []);
+  }, [queryClient]);
 
   return signals;
 }

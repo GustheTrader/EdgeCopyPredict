@@ -150,6 +150,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        // One-shot settlement/backfill sweep: settles resolved positions and backfills
+        // durable condition_ids, then exits. Run on demand to clear stuck positions.
+        "pnl-refresh-once" => pnl_refresh::run_pnl_refresh_once(&config).await,
         other => {
             bail!("unsupported worker mode '{}'", other)
         }

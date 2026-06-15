@@ -9,12 +9,13 @@ use anyhow::Result;
 use arbitek_config::AppConfig;
 use arbitek_db::{
     connect_execution_worker as connect, AlertRepository, CopyIntentRepository, DbPool,
-    FillRepository, OrderRepository, PositionRepository, SystemSettingsRepository,
+    FillRepository, FollowerRepository, OrderRepository, PositionRepository,
+    SystemSettingsRepository,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
-use time::OffsetDateTime;
-use tracing::{info, warn};
+use time::{Duration, OffsetDateTime};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const PAPER_FOLLOWER_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -54,6 +55,7 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
     let order_repo = OrderRepository::new(pool.clone());
     let fill_repo = FillRepository::new(pool.clone());
     let position_repo = PositionRepository::new(pool.clone());
+    let follower_repo = FollowerRepository::new(pool.clone());
     let alert_repo = AlertRepository::new(pool.clone());
 
     let mut executed = 0usize;
@@ -69,11 +71,100 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
             continue;
         }
 
-        let contracts = intent.target_contracts;
-        let price = intent.price_limit;
+        if intent_is_stale(intent.created_at, config.worker.max_trade_age_seconds) {
+            warn!(
+                intent_id = %intent.id,
+                created_at = %intent.created_at,
+                max_age_seconds = config.worker.max_trade_age_seconds,
+                "[PAPER] rejecting stale copy intent before execution"
+            );
+            copy_repo.update_status(intent.id, "rejected").await?;
+            rejected += 1;
+            continue;
+        }
+
+        let is_buy = intent.action == "buy";
+
+        // Simulate a fill price that includes the follower's configured slippage:
+        // buys fill slightly higher, sells slightly lower (clamped to [0.01, 0.99]).
+        let cfg = match follower_repo.get_by_id(intent.follower_account_id).await? {
+            Some(f) => arbitek_domain::copy_config::CopyConfig::from_value(&f.risk_config),
+            None => arbitek_domain::copy_config::CopyConfig::default(),
+        };
+        let slip = cfg.slippage_fraction();
+        let price = if is_buy {
+            (intent.price_limit * (Decimal::ONE + slip)).min(Decimal::new(99, 2))
+        } else {
+            (intent.price_limit * (Decimal::ONE - slip)).max(Decimal::new(1, 2))
+        };
+
+        // Stable market UUID for this position (shared with the live path).
+        let market_id =
+            arbitek_domain::stable_market_id(intent.market_id, &intent.signal_platform_market_id);
+
+        if is_buy
+            && position_repo
+                .is_closed_position(intent.follower_account_id, market_id, &intent.outcome)
+                .await?
+        {
+            warn!(
+                intent_id = %intent.id,
+                market_id = %market_id,
+                outcome = %intent.outcome,
+                "[PAPER] rejecting stale buy for an already closed position"
+            );
+            copy_repo.update_status(intent.id, "rejected").await?;
+            let _ = alert_repo
+                .insert(
+                    "warning",
+                    "paper_market_closed",
+                    &format!(
+                        "Paper buy intent {} rejected: market/outcome is already closed",
+                        intent.id
+                    ),
+                    Some("copy_intent"),
+                    Some(intent.id),
+                )
+                .await;
+            rejected += 1;
+            continue;
+        }
+
+        // Clamp sells to the follower's actual holding so a master exit never drives
+        // the position negative (a phantom short). If nothing is held, the position is
+        // already flat — treat the close as satisfied without a wallet movement.
+        let contracts = if is_buy {
+            intent.target_contracts
+        } else {
+            let held = position_repo
+                .open_contracts(intent.follower_account_id, market_id, &intent.outcome)
+                .await?;
+            match arbitek_domain::clamp_sell_to_held(intent.target_contracts, held) {
+                Some(c) => {
+                    if c < intent.target_contracts {
+                        warn!(
+                            intent_id = %intent.id,
+                            requested = %intent.target_contracts,
+                            held = %held,
+                            "[PAPER] clamping sell to held contracts — master sold more than follower holds"
+                        );
+                    }
+                    c
+                }
+                None => {
+                    info!(
+                        intent_id = %intent.id,
+                        outcome = %intent.outcome,
+                        "[PAPER] sell intent with no open position to close — marking executed (already flat)"
+                    );
+                    copy_repo.update_status(intent.id, "executed").await?;
+                    continue;
+                }
+            }
+        };
+
         let notional = contracts * price;
         let fee = estimate_fee(contracts, price);
-        let is_buy = intent.action == "buy";
 
         let balance = settings
             .get_decimal("paper_wallet_balance", Decimal::new(1000, 0))
@@ -171,21 +262,6 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
             )
             .await;
 
-        // Stable market UUID for position tracking.
-        // For Polymarket condition_ids (0x + 64 hex chars), the first 16 bytes of the
-        // condition_id are used directly as the UUID — this makes pnl-refresh's
-        // LIKE-pattern lookup (market_uuid_hex% matches condition_id) work correctly.
-        let market_id = intent.market_id.unwrap_or_else(|| {
-            let mid = &intent.signal_platform_market_id;
-            if mid.starts_with("0x") && mid.len() >= 34 {
-                if let Ok(bytes) = hex::decode(&mid[2..34]) {
-                    if let Ok(arr) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                        return Uuid::from_bytes(arr);
-                    }
-                }
-            }
-            Uuid::new_v5(&Uuid::NAMESPACE_URL, mid.as_bytes())
-        });
         let contracts_delta = if is_buy { contracts } else { -contracts };
 
         if let Err(e) = position_repo
@@ -193,6 +269,7 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
                 intent.follower_account_id,
                 &intent.platform,
                 market_id,
+                Some(intent.signal_platform_market_id.as_str()),
                 intent.market_title.as_deref(),
                 None,
                 &intent.outcome,
@@ -226,17 +303,22 @@ async fn run_paper_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<(
         }
     }
 
-    info!(executed, rejected, "paper execution pass completed");
+    debug!(executed, rejected, "paper execution pass completed");
     Ok(())
+}
+
+fn intent_is_stale(created_at: OffsetDateTime, max_age_seconds: u64) -> bool {
+    let seconds = max_age_seconds.min(i64::MAX as u64) as i64;
+    created_at < OffsetDateTime::now_utc() - Duration::seconds(seconds)
 }
 
 pub async fn run_paper_execution(config: &AppConfig) -> Result<()> {
     let pool = connect(&config.database_url).await?;
     let interval =
-        std::time::Duration::from_secs(config.worker.polymarket_poll_interval_seconds.max(5));
+        std::time::Duration::from_millis(config.worker.paper_execution_interval_ms.max(50));
     info!(
-        "paper-execution worker starting — polling every {}s",
-        interval.as_secs()
+        "paper-execution worker starting — polling every {}ms",
+        interval.as_millis()
     );
     loop {
         if let Err(e) = run_paper_execution_pass(config, &pool).await {

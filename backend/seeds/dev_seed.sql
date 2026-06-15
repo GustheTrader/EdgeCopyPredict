@@ -4,8 +4,18 @@
 --       or signals will be fetched from the wrong addresses.
 
 INSERT INTO followers (id, display_name, status, base_currency, wallet_address, platform, risk_config) VALUES
-    ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Kalshi Paper Slave', 'active', 'USD', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'kalshi', '{"bankroll": 1000, "copy_scale": 1.0, "max_notional": 500, "min_notional": 0, "max_trade_bankroll_pct": 50}'),
-    ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Demo Follower 2', 'active', 'USD', '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'polymarket', '{"bankroll": 5000, "copy_scale": 0.3, "max_notional": 300}')
+    ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Kalshi Paper Slave', 'active', 'USD', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'kalshi', '{
+      "copy_mode": "mirror",
+      "sizing_mode": "proportional_bankroll",
+      "follower_bankroll": 1000,
+      "master_bankroll": 50000
+    }'),
+    ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Demo Follower 2', 'active', 'USD', '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'polymarket', '{
+      "copy_mode": "mirror",
+      "sizing_mode": "proportional_bankroll",
+      "follower_bankroll": 1000,
+      "master_bankroll": 50000
+    }')
 ON CONFLICT DO NOTHING;
 
 INSERT INTO market_mappings (id, polymarket_condition_id, polymarket_slug, kalshi_ticker, kalshi_event_ticker, confidence, enabled) VALUES

@@ -3,9 +3,14 @@ import {
   useToggleKalshiExecution,
   useResetPaperWallet,
   usePaperWalletMovements,
+  usePnlSummary,
   type PaperWalletMovement,
 } from "@/hooks/useApi";
 import { GlobalKillSwitch } from "@/components/layout/GlobalKillSwitch";
+
+const PAPER_FOLLOWER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const WALLET_HISTORY_LIMIT = 1000;
+const VISIBLE_LEDGER_ROWS = 50;
 
 const money = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -34,9 +39,19 @@ export function SettingsPage() {
   const { data: status, isLoading } = useSystemStatus();
   const toggleKalshi = useToggleKalshiExecution();
   const resetWallet = useResetPaperWallet();
-  const { data: walletMovements = [] } = usePaperWalletMovements();
+  const { data: pnlSummaries = [] } = usePnlSummary();
+  const { data: walletMovements = [] } = usePaperWalletMovements(WALLET_HISTORY_LIMIT);
   const kalshiEnabled = status?.kalshi_execution_enabled ?? false;
   const paperBalance = status?.paper_wallet_balance ?? 1000;
+  const paperPnl = pnlSummaries.find((row) => row.follower_account_id === PAPER_FOLLOWER_ID) ?? null;
+  const totalPnl = paperPnl?.total_pnl ?? null;
+  const realizedPnl = paperPnl?.realized_pnl ?? null;
+  const unrealizedPnl = paperPnl?.unrealized_pnl ?? null;
+  const openPositions = paperPnl?.open_positions ?? 0;
+
+  const totalIn  = walletMovements.filter(m => m.amount > 0).reduce((s, m) => s + m.amount, 0);
+  const totalOut = walletMovements.filter(m => m.amount < 0).reduce((s, m) => s + m.amount, 0);
+  const netCashFlow = totalIn + totalOut;
 
   return (
     <div className="space-y-4">
@@ -92,28 +107,71 @@ export function SettingsPage() {
           {/* Paper wallet balance + reset */}
           {!kalshiEnabled && (
             <div className="space-y-3">
-              <div className="flex items-center justify-between rounded bg-gray-900 border border-gray-800 px-4 py-3">
-                <div>
-                  <p className="text-xs text-gray-500">Demo Wallet Balance (Supabase)</p>
+              <div className="grid grid-cols-1 md:grid-cols-[1.2fr_1fr_1fr_auto] gap-3">
+                <div className="rounded bg-gray-900 border border-gray-800 px-4 py-3">
+                  <p className="text-xs text-gray-500">Available Cash</p>
                   <p className="text-lg font-semibold text-yellow-300 mt-0.5">
                     {money.format(paperBalance)}
                   </p>
-                  <p className="text-xs text-gray-600 mt-0.5">Cash ledger updates with every paper wallet movement</p>
+                  <p className="text-xs text-gray-600 mt-0.5">Liquid cash — excludes value locked in open positions</p>
                 </div>
-                <button
-                  onClick={() => resetWallet.mutate()}
-                  disabled={resetWallet.isPending}
-                  className="rounded px-3 py-1.5 text-xs font-medium bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {resetWallet.isPending ? "Resetting..." : "Reset to $1,000"}
-                </button>
+                <div className="rounded bg-gray-900 border border-gray-800 px-4 py-3">
+                  <p className="text-xs text-gray-500">Total P&L</p>
+                  <p className={`text-lg font-semibold mt-0.5 ${
+                    (totalPnl ?? 0) >= 0 ? "text-green-400" : "text-red-400"
+                  }`}>
+                    {totalPnl == null ? "—" : formatSignedMoney(totalPnl)}
+                  </p>
+                  <p className="text-xs text-gray-600 mt-0.5">From closed and open positions</p>
+                </div>
+                <div className="rounded bg-gray-900 border border-gray-800 px-4 py-3">
+                  <p className="text-xs text-gray-500">Open P&L</p>
+                  <p className={`text-lg font-semibold mt-0.5 ${
+                    (unrealizedPnl ?? 0) >= 0 ? "text-green-400" : "text-red-400"
+                  }`}>
+                    {unrealizedPnl == null ? "—" : formatSignedMoney(unrealizedPnl)}
+                  </p>
+                  <p className="text-xs text-gray-600 mt-0.5">Closed {realizedPnl == null ? "—" : formatSignedMoney(realizedPnl)}</p>
+                </div>
+                <div className="rounded bg-gray-900 border border-gray-800 px-4 py-3 flex flex-col justify-center gap-2">
+                  <button
+                    onClick={() => resetWallet.mutate()}
+                    disabled={resetWallet.isPending}
+                    className="rounded px-3 py-1.5 text-xs font-medium bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {resetWallet.isPending ? "Resetting..." : "Reset to $1,000"}
+                  </button>
+                  <p className="text-center text-xs text-gray-600">{openPositions} open positions</p>
+                </div>
               </div>
 
               <div className="rounded bg-gray-900 border border-gray-800 overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
                   <h4 className="text-xs font-medium uppercase tracking-wide text-gray-400">Paper Wallet Ledger</h4>
-                  <span className="text-xs text-gray-600">{walletMovements.length} rows</span>
+                  {walletMovements.length > 0 && (
+                    <span className="rounded-full bg-gray-800 px-2 py-0.5 text-xs font-medium text-gray-300">
+                      Latest {walletMovements.length}
+                    </span>
+                  )}
                 </div>
+                {walletMovements.length > 0 && (
+                  <div className="grid grid-cols-3 divide-x divide-gray-800 border-b border-gray-800">
+                    <div className="px-4 py-2">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wide">Total In</p>
+                      <p className="text-sm font-semibold text-green-400">+{money.format(totalIn)}</p>
+                    </div>
+                    <div className="px-4 py-2">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wide">Total Out</p>
+                      <p className="text-sm font-semibold text-red-400">{money.format(totalOut)}</p>
+                    </div>
+                    <div className="px-4 py-2">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wide">Net Cash Flow</p>
+                      <p className={`text-sm font-semibold ${netCashFlow >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        {formatSignedMoney(netCashFlow)}
+                      </p>
+                    </div>
+                  </div>
+                )}
                 <div className="max-h-80 overflow-auto">
                   <table className="min-w-full text-xs">
                     <thead className="bg-gray-950 text-gray-500">
@@ -126,7 +184,7 @@ export function SettingsPage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-800">
-                      {walletMovements.slice(0, 50).map((movement) => (
+                      {walletMovements.slice(0, VISIBLE_LEDGER_ROWS).map((movement) => (
                         <tr key={movement.id} className="text-gray-300">
                           <td className="px-3 py-2 whitespace-nowrap text-gray-500">
                             {new Date(movement.created_at).toLocaleString()}

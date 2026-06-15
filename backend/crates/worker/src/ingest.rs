@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1_000;
+const POLYMARKET_TRADE_FETCH_LIMIT: u16 = 25;
 
 /// Poll Polymarket Data API for new trades and store them as raw events.
 pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
@@ -25,8 +26,10 @@ pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
 
     info!("starting polymarket data api ingestion");
 
-    // Cache condition_id -> market title across poll cycles to avoid repeated lookups.
-    let mut market_title_cache: HashMap<String, String> = HashMap::new();
+    // Cache condition_id -> (market title, end_date_iso) across poll cycles to avoid
+    // repeated /markets lookups. Both are injected into the raw payload so the signal
+    // normalizer can label signals and enforce the follower's max_days_out filter.
+    let mut market_meta_cache: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
 
     loop {
         info!("polling polymarket trades");
@@ -44,7 +47,11 @@ pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
                 for master in active_masters {
                     let wallet = master.wallet_address.unwrap();
                     let trades = match retry_with_backoff(
-                        || async { client.get_trades_for_user(&wallet, 100).await },
+                        || async {
+                            client
+                                .get_trades_for_user(&wallet, POLYMARKET_TRADE_FETCH_LIMIT)
+                                .await
+                        },
                         &format!("polymarket trades for {}", wallet),
                     )
                     .await
@@ -86,49 +93,65 @@ pub async fn run_polymarket_ingest(config: &AppConfig) -> Result<()> {
                     );
 
                     for trade in verified {
-                        // Fetch market title from Polymarket /markets API if not cached.
-                        let injected_title: Option<String> = if let Some(cond_id) =
-                            trade.condition_id.as_deref()
-                        {
-                            if let Some(cached) = market_title_cache.get(cond_id) {
-                                Some(cached.clone())
-                            } else {
-                                match market_client.get_market_by_condition(cond_id).await {
-                                    Ok(Some(market_info)) => {
-                                        let title = market_info
-                                            .get("question")
-                                            .or_else(|| market_info.get("title"))
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from);
-                                        if let Some(ref t) = title {
-                                            market_title_cache
-                                                .insert(cond_id.to_owned(), t.clone());
+                        // Skip historical trades — only act on recent ones so the
+                        // back-fill isn't copied as if the master just traded.
+                        if trade_is_stale(trade.timestamp, config.worker.max_trade_age_seconds) {
+                            continue;
+                        }
+
+                        // Fetch market title + end date from Polymarket /markets API if not cached.
+                        let (injected_title, injected_end_date): (Option<String>, Option<String>) =
+                            if let Some(cond_id) = trade.condition_id.as_deref() {
+                                if let Some(cached) = market_meta_cache.get(cond_id) {
+                                    cached.clone()
+                                } else {
+                                    match market_client.get_market_by_condition(cond_id).await {
+                                        Ok(Some(market_info)) => {
+                                            let title = market_info
+                                                .get("question")
+                                                .or_else(|| market_info.get("title"))
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            let end_date = market_info
+                                                .get("end_date_iso")
+                                                .or_else(|| market_info.get("endDateIso"))
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            market_meta_cache.insert(
+                                                cond_id.to_owned(),
+                                                (title.clone(), end_date.clone()),
+                                            );
+                                            (title, end_date)
                                         }
-                                        title
-                                    }
-                                    Ok(None) => None,
-                                    Err(e) => {
-                                        warn!(condition_id = %cond_id, "failed to fetch market info: {}", e);
-                                        None
+                                        Ok(None) => (None, None),
+                                        Err(e) => {
+                                            warn!(condition_id = %cond_id, "failed to fetch market info: {}", e);
+                                            (None, None)
+                                        }
                                     }
                                 }
-                            }
-                        } else {
-                            None
-                        };
+                            } else {
+                                (None, None)
+                            };
 
                         let mut event = trade_to_raw_event(&trade, master.id);
 
-                        // Inject title into the nested raw JSON so the signal
-                        // normalizer can pick it up via trade.raw.get("title").
-                        if let Some(title) = injected_title {
-                            if let Some(raw_obj) = event
-                                .raw_payload
-                                .get_mut("raw")
-                                .and_then(|v| v.as_object_mut())
-                            {
+                        // Inject title + end date into the nested raw JSON so the signal
+                        // normalizer can pick them up via trade.raw.get(...).
+                        if let Some(raw_obj) = event
+                            .raw_payload
+                            .get_mut("raw")
+                            .and_then(|v| v.as_object_mut())
+                        {
+                            if let Some(title) = injected_title {
                                 raw_obj
                                     .insert("title".to_owned(), serde_json::Value::String(title));
+                            }
+                            if let Some(end_date) = injected_end_date {
+                                raw_obj.insert(
+                                    "end_date_iso".to_owned(),
+                                    serde_json::Value::String(end_date),
+                                );
                             }
                         }
 
@@ -219,6 +242,10 @@ pub async fn run_kalshi_ingest(config: &AppConfig) -> Result<()> {
                     "fetched kalshi own-account orders"
                 );
                 for trade in trades {
+                    // Skip historical trades — only act on recent ones.
+                    if trade_is_stale(trade.timestamp, config.worker.max_trade_age_seconds) {
+                        continue;
+                    }
                     let event = kalshi_trade_to_raw_event(&trade, own_account_id);
                     let external_id = event.external_event_id.clone();
                     match raw_repo.insert_or_ignore(&event).await {
@@ -265,7 +292,10 @@ fn trade_to_raw_event(trade: &PolymarketDataApiTrade, master_id: Uuid) -> RawEve
         source: "data_api".to_owned(),
         external_event_id: trade.external_event_id(),
         raw_payload: serde_json::to_value(trade).unwrap_or_default(),
-        detected_at: trade.timestamp.unwrap_or_else(OffsetDateTime::now_utc),
+        // When *we* observed the trade. The master's on-platform trade time is
+        // preserved in the raw payload (trade.timestamp) and surfaced as the
+        // signal's event_timestamp; keep these two clocks distinct.
+        detected_at: OffsetDateTime::now_utc(),
         processed_at: None,
         source_entity_id: Some(master_id),
         source_entity_type: Some("master".to_owned()),
@@ -281,11 +311,25 @@ fn kalshi_trade_to_raw_event(trade: &KalshiDataApiTrade, master_id: Uuid) -> Raw
         source: "data_api".to_owned(),
         external_event_id: trade.external_event_id(),
         raw_payload: serde_json::to_value(trade).unwrap_or_default(),
-        detected_at: trade.timestamp.unwrap_or_else(OffsetDateTime::now_utc),
+        // When *we* observed the trade — see trade_to_raw_event for rationale.
+        detected_at: OffsetDateTime::now_utc(),
         processed_at: None,
         source_entity_id: Some(master_id),
         source_entity_type: Some("master".to_owned()),
         status: "new".to_owned(),
+    }
+}
+
+/// Returns true if a trade's on-platform timestamp is older than `max_age_seconds`
+/// and should be skipped during ingest. This prevents the historical back-fill
+/// (the API returns the last N trades regardless of age) from being replayed as
+/// live signals. Trades without a timestamp are treated as fresh (not skipped).
+fn trade_is_stale(timestamp: Option<OffsetDateTime>, max_age_seconds: u64) -> bool {
+    match timestamp {
+        Some(ts) => {
+            (OffsetDateTime::now_utc() - ts) > time::Duration::seconds(max_age_seconds as i64)
+        }
+        None => false,
     }
 }
 
@@ -374,6 +418,17 @@ mod tests {
         assert_eq!(event.source_entity_id, Some(master_id));
         assert_eq!(event.source_entity_type, Some("master".to_owned()));
         assert_eq!(event.status, "new");
+    }
+
+    #[test]
+    fn trade_is_stale_filters_old_trades() {
+        let now = OffsetDateTime::now_utc();
+        // 10 minutes old, 5-minute window → stale.
+        assert!(trade_is_stale(Some(now - time::Duration::minutes(10)), 300));
+        // 1 minute old, 5-minute window → fresh.
+        assert!(!trade_is_stale(Some(now - time::Duration::minutes(1)), 300));
+        // Missing timestamp → treated as fresh.
+        assert!(!trade_is_stale(None, 300));
     }
 
     #[tokio::test]

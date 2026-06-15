@@ -100,23 +100,32 @@ export function useFollowers() {
   return useQuery({ queryKey: ["followers"], queryFn: () => fetchJson<any[]>("/followers") });
 }
 
-export function useSignalsList() {
+export function useSignalsList(perPage = 100) {
+  const limit = Math.max(1, Math.min(perPage, 200));
   return useQuery({
-    queryKey: ["signals"],
-    queryFn: () => fetchJson<any[]>("/signals"),
-    refetchInterval: 5000,
+    queryKey: ["signals", limit],
+    queryFn: () => fetchJson<any[]>(`/signals?per_page=${limit}`),
+    refetchInterval: 1000,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: "always",
+    staleTime: 0,
   });
 }
 
-export function useOrders() {
-  return useQuery({ queryKey: ["orders"], queryFn: () => fetchJson<any[]>("/orders") });
+export function useOrders(perPage = 200) {
+  const limit = Math.max(1, Math.min(perPage, 1000));
+  return useQuery({
+    queryKey: ["orders", limit],
+    queryFn: () => fetchJson<any[]>(`/orders?per_page=${limit}`),
+  });
 }
 
-export function usePositions() {
+export function usePositions(perPage = 50) {
+  const limit = Math.max(1, Math.min(perPage, 1000));
   return useQuery({
-    queryKey: ["positions"],
-    queryFn: () => fetchJson<any[]>("/positions"),
-    refetchInterval: 5000,
+    queryKey: ["positions", limit],
+    queryFn: () => fetchJson<any[]>(`/positions?per_page=${limit}`),
+    refetchInterval: 1000,
   });
 }
 
@@ -170,14 +179,15 @@ export function usePnlSummary() {
       trade_count: number;
       open_positions: number;
     }>>("/pnl"),
-    refetchInterval: 5000,
+    refetchInterval: 1000,
   });
 }
 
-export function usePaperWalletMovements() {
+export function usePaperWalletMovements(perPage = 200) {
+  const limit = Math.max(1, Math.min(perPage, 1000));
   return useQuery({
-    queryKey: ["paper-wallet-movements"],
-    queryFn: () => fetchJson<PaperWalletMovement[]>("/paper-wallet/movements"),
+    queryKey: ["paper-wallet-movements", limit],
+    queryFn: () => fetchJson<PaperWalletMovement[]>(`/paper-wallet/movements?per_page=${limit}`),
     refetchInterval: 5000,
   });
 }

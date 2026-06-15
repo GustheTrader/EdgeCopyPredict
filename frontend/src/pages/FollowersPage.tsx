@@ -11,6 +11,7 @@ import {
   usePnlSummary,
 } from "@/hooks/useApi";
 import { RiskConfigEditor } from "@/components/followers/RiskConfigEditor";
+import { CopyConfigWizard } from "@/components/followers/CopyConfigWizard";
 
 function medal(rank: number) {
   if (rank === 0) return "🥇";
@@ -42,6 +43,7 @@ export function FollowersPage() {
   const deleteFollower = useDeleteFollower();
 
   const [editing, setEditing] = useState<string | null>(null);
+  const [configuring, setConfiguring] = useState<string | null>(null);
   const [editingWallet, setEditingWallet] = useState<string | null>(null);
   const [walletInput, setWalletInput] = useState("");
   const [newName, setNewName] = useState("");
@@ -233,8 +235,14 @@ export function FollowersPage() {
                         {f.status === "active" ? "Pause" : "Activate"}
                       </button>
                       <button
-                        onClick={() => setEditing(editing === f.id ? null : f.id)}
+                        onClick={() => setConfiguring(f.id)}
                         className="rounded bg-blue-700 px-2 py-1 text-xs text-white hover:bg-blue-600"
+                      >
+                        Configure
+                      </button>
+                      <button
+                        onClick={() => setEditing(editing === f.id ? null : f.id)}
+                        className="rounded bg-gray-700 px-2 py-1 text-xs text-white hover:bg-gray-600"
                       >
                         Risk
                       </button>
@@ -278,6 +286,14 @@ export function FollowersPage() {
             onCancel={() => setEditing(null)}
           />
         </div>
+      )}
+
+      {configuring && followers?.find((f: any) => f.id === configuring) && (
+        <CopyConfigWizard
+          follower={followers.find((f: any) => f.id === configuring)}
+          onSave={(cfg) => { updateRiskConfig.mutate({ id: configuring, config: cfg }); setConfiguring(null); }}
+          onCancel={() => setConfiguring(null)}
+        />
       )}
     </div>
   );

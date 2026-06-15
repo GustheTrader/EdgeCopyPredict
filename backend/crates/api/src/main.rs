@@ -15,7 +15,7 @@ use axum::{
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
@@ -90,7 +90,7 @@ struct StatusBody {
 #[derive(Deserialize)]
 struct CreateMasterBody {
     display_name: String,
-    #[serde(default)]
+    #[serde(default = "default_active")]
     status: String,
     #[serde(default = "default_master_weight")]
     master_weight: f64,
@@ -113,7 +113,7 @@ struct CreateFollowerBody {
     wallet_address: Option<String>,
     #[serde(default = "default_polymarket")]
     platform: String,
-    #[serde(default)]
+    #[serde(default = "default_risk_config")]
     risk_config: Value,
 }
 
@@ -129,12 +129,26 @@ fn default_polymarket() -> String {
     "polymarket".to_owned()
 }
 
+fn default_risk_config() -> Value {
+    json!({
+        "copy_mode": "mirror",
+        "sizing_mode": "proportional_bankroll",
+        "follower_bankroll": 1000,
+        "master_bankroll": 50000
+    })
+}
+
 #[derive(Deserialize)]
 struct SignalQuery {
     platform: Option<String>,
     master_id: Option<Uuid>,
     status: Option<String>,
     page: Option<i32>,
+    per_page: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct HistoryLimitQuery {
     per_page: Option<i32>,
 }
 
@@ -379,18 +393,47 @@ async fn sync_copy_wallets(pool: &sqlx::PgPool, copy_wallets: &str) {
 
     for wallet in wallets {
         let wallet_lc = wallet.to_lowercase();
-        // Check if a master with this wallet address already exists.
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM masters WHERE lower(wallet_address) = lower($1))",
+        // Keep active/manual rows intact, but do not let deleted rows shadow
+        // configured wallets forever.
+        let active_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM masters WHERE lower(wallet_address) = lower($1) AND status <> 'deleted')",
         )
         .bind(&wallet_lc)
         .fetch_one(pool)
         .await
         .unwrap_or(false);
 
-        if exists {
+        if active_exists {
             info!(wallet = %wallet_lc, "master already in DB — skipping");
             continue;
+        }
+
+        let reactivated: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+            r#"UPDATE masters
+               SET status = 'active', updated_at = now()
+               WHERE id = (
+                   SELECT id
+                   FROM masters
+                   WHERE lower(wallet_address) = lower($1)
+                     AND status = 'deleted'
+                   ORDER BY updated_at DESC, created_at DESC
+                   LIMIT 1
+               )
+               RETURNING display_name"#,
+        )
+        .bind(&wallet_lc)
+        .fetch_optional(pool)
+        .await;
+
+        match reactivated {
+            Ok(Some((display_name,))) => {
+                info!(wallet = %wallet_lc, display_name = %display_name, "reactivated master from COPY_WALLETS");
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(wallet = %wallet_lc, "failed to reactivate deleted master: {}", e);
+            }
         }
 
         // Derive a short display name from the wallet address (first 6 + last 4 chars).
@@ -591,41 +634,19 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn system_status(State(state): State<AppState>) -> ApiResult<Json<SystemStatusDto>> {
-    let settings = arbitek_db::SystemSettingsRepository::new(state.pool.clone());
-    let live_trading = settings.get_bool("live_trading_enabled", false).await?;
-    let kalshi_exec = settings.get_bool("kalshi_execution_enabled", false).await?;
-    let paper_balance = settings
-        .get_decimal("paper_wallet_balance", rust_decimal::Decimal::new(1000, 0))
-        .await
-        .unwrap_or(rust_decimal::Decimal::new(1000, 0))
-        .to_f64()
-        .unwrap_or(1000.0);
-
-    let open_count = AlertRepository::new(state.pool.clone())
-        .count_open()
-        .await?;
-    let row = sqlx::query("select max(detected_at) as ts from signals")
-        .fetch_one(&state.pool)
-        .await?;
-    let last_ts: Option<OffsetDateTime> = row.try_get("ts")?;
-
-    Ok(Json(SystemStatusDto {
-        live_trading_enabled: live_trading,
-        kalshi_execution_enabled: kalshi_exec,
-        paper_wallet_balance: paper_balance,
-        worker_mode: state.config.worker.mode.clone(),
-        open_alert_count: open_count,
-        last_signal_at: last_ts.and_then(|dt| dt.format(&Rfc3339).ok()),
-    }))
+    let dto = build_system_status_dto(&state.pool, &state.config.worker.mode).await?;
+    Ok(Json(dto))
 }
 
 async fn list_paper_wallet_movements(
     State(state): State<AppState>,
+    Query(q): Query<HistoryLimitQuery>,
 ) -> ApiResult<Json<Vec<PaperWalletMovementDto>>> {
     const PAPER_FOLLOWER: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     let follower_id = Uuid::parse_str(PAPER_FOLLOWER).expect("sentinel UUID is valid");
+    let limit = q.per_page.unwrap_or(200).max(1).min(1000) as i64;
     let records = PaperWalletMovementRepository::new(state.pool)
-        .list_for_follower(follower_id, 200)
+        .list_for_follower(follower_id, limit)
         .await?;
 
     Ok(Json(
@@ -953,8 +974,12 @@ async fn get_signal_timeline(
 // Handlers — orders, fills, positions, pnl, alerts
 // ---------------------------------------------------------------------------
 
-async fn list_orders(State(state): State<AppState>) -> ApiResult<Json<Vec<OrderDto>>> {
-    let records = OrderRepository::new(state.pool).list_recent(200).await?;
+async fn list_orders(
+    State(state): State<AppState>,
+    Query(q): Query<HistoryLimitQuery>,
+) -> ApiResult<Json<Vec<OrderDto>>> {
+    let limit = q.per_page.unwrap_or(200).max(1).min(1000) as i64;
+    let records = OrderRepository::new(state.pool).list_recent(limit).await?;
     Ok(Json(records.into_iter().map(order_to_dto).collect()))
 }
 
@@ -1389,7 +1414,7 @@ async fn toggle_system(State(state): State<AppState>) -> ApiResult<Json<SystemSt
     let settings = arbitek_db::SystemSettingsRepository::new(state.pool.clone());
     let current = settings.get_bool("live_trading_enabled", false).await?;
     settings.set_bool("live_trading_enabled", !current).await?;
-    let dto = build_system_status_dto(&state.pool, &settings, &state.config.worker.mode).await?;
+    let dto = build_system_status_dto(&state.pool, &state.config.worker.mode).await?;
     let _ = state.system_tx.send(dto.clone());
     Ok(Json(dto))
 }
@@ -1406,7 +1431,7 @@ async fn toggle_kalshi_execution(
     if current {
         reset_paper_state(&state.pool, &settings).await?;
     }
-    let dto = build_system_status_dto(&state.pool, &settings, &state.config.worker.mode).await?;
+    let dto = build_system_status_dto(&state.pool, &state.config.worker.mode).await?;
     let _ = state.system_tx.send(dto.clone());
     Ok(Json(dto))
 }
@@ -1414,15 +1439,16 @@ async fn toggle_kalshi_execution(
 async fn reset_paper_wallet(State(state): State<AppState>) -> ApiResult<Json<SystemStatusDto>> {
     let settings = arbitek_db::SystemSettingsRepository::new(state.pool.clone());
     reset_paper_state(&state.pool, &settings).await?;
-    let dto = build_system_status_dto(&state.pool, &settings, &state.config.worker.mode).await?;
+    let dto = build_system_status_dto(&state.pool, &state.config.worker.mode).await?;
     let _ = state.system_tx.send(dto.clone());
     Ok(Json(dto))
 }
 
-/// Wipe all paper-trading state and reset the wallet to $1 000.
+/// Wipe paper-trading state and reset the wallet to $1 000.
 ///
 /// Called from toggle (live→paper) and the explicit reset endpoint.
-/// Positions are cleared so the ledger matches the fresh wallet.
+/// Positions, orders, fills, copy intents, alerts, and wallet movements are
+/// cleared so the ledger starts fresh.
 /// raw_events dedup cache is intentionally kept — deleting it would cause
 /// the ingest worker to re-process all recent Polymarket trades on its next
 /// poll, generating duplicate copy_intents and re-draining the wallet.
@@ -1450,7 +1476,30 @@ async fn reset_paper_state(
     )
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO system_settings (key, value, updated_at) VALUES ('kalshi_execution_enabled', 'false', NOW())
+         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = NOW()"
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM alerts").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM fills WHERE follower_account_id = $1")
+        .bind(follower_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM orders WHERE follower_account_id = $1")
+        .bind(follower_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM copy_intents WHERE follower_account_id = $1")
+        .bind(follower_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM positions WHERE follower_account_id = $1")
+        .bind(follower_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM paper_wallet_movements WHERE follower_account_id = $1")
         .bind(follower_id)
         .execute(&mut *tx)
         .await?;
@@ -1472,24 +1521,55 @@ async fn reset_paper_state(
     Ok(())
 }
 
-async fn build_system_status_dto(
+pub(crate) async fn build_system_status_dto(
     pool: &sqlx::PgPool,
-    settings: &arbitek_db::SystemSettingsRepository,
     worker_mode: &str,
 ) -> Result<SystemStatusDto, ApiError> {
-    let live_trading = settings.get_bool("live_trading_enabled", false).await?;
-    let kalshi_exec = settings.get_bool("kalshi_execution_enabled", false).await?;
-    let paper_balance = settings
-        .get_decimal("paper_wallet_balance", rust_decimal::Decimal::new(1000, 0))
-        .await
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(
+                MAX(value) FILTER (WHERE key = 'live_trading_enabled'),
+                'false'
+            ) AS live_trading_enabled,
+            COALESCE(
+                MAX(value) FILTER (WHERE key = 'kalshi_execution_enabled'),
+                'false'
+            ) AS kalshi_execution_enabled,
+            COALESCE(
+                MAX(value) FILTER (WHERE key = 'paper_wallet_balance'),
+                '1000'
+            ) AS paper_wallet_balance,
+            (SELECT COUNT(*) FROM alerts WHERE status = 'open') AS open_alert_count,
+            (SELECT MAX(detected_at) FROM signals) AS last_signal_at
+        FROM system_settings
+        WHERE key IN (
+            'live_trading_enabled',
+            'kalshi_execution_enabled',
+            'paper_wallet_balance'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let live_trading = row
+        .try_get::<String, _>("live_trading_enabled")?
+        .parse::<bool>()
+        .unwrap_or(false);
+    let kalshi_exec = row
+        .try_get::<String, _>("kalshi_execution_enabled")?
+        .parse::<bool>()
+        .unwrap_or(false);
+    let paper_balance = row
+        .try_get::<String, _>("paper_wallet_balance")?
+        .parse::<rust_decimal::Decimal>()
         .unwrap_or(rust_decimal::Decimal::new(1000, 0))
         .to_f64()
         .unwrap_or(1000.0);
-    let open_count = AlertRepository::new(pool.clone()).count_open().await?;
-    let row = sqlx::query("select max(detected_at) as ts from signals")
-        .fetch_one(pool)
-        .await?;
-    let last_ts: Option<OffsetDateTime> = row.try_get("ts")?;
+    let open_count: i64 = row.try_get("open_alert_count")?;
+    let last_ts: Option<OffsetDateTime> = row.try_get("last_signal_at")?;
+
     Ok(SystemStatusDto {
         live_trading_enabled: live_trading,
         kalshi_execution_enabled: kalshi_exec,

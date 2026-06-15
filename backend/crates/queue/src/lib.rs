@@ -6,6 +6,8 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+const MAX_STREAM_LEN: usize = 1_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamName {
     RawEvents,
@@ -71,17 +73,20 @@ impl RedisStreamPublisher {
         let payload = serde_json::to_string(envelope)?;
         let emitted_at = envelope.emitted_at.unix_timestamp().to_string();
         let mut conn = self.manager.clone();
-        let message_id: String = conn
-            .xadd(
-                stream_name,
-                "*",
-                &[
-                    ("id", envelope.id.to_string()),
-                    ("event_type", envelope.event_type.clone()),
-                    ("emitted_at", emitted_at),
-                    ("payload", payload),
-                ],
-            )
+        let message_id: String = redis::cmd("XADD")
+            .arg(stream_name)
+            .arg("MAXLEN")
+            .arg(MAX_STREAM_LEN)
+            .arg("*")
+            .arg("id")
+            .arg(envelope.id.to_string())
+            .arg("event_type")
+            .arg(envelope.event_type.clone())
+            .arg("emitted_at")
+            .arg(emitted_at)
+            .arg("payload")
+            .arg(payload)
+            .query_async(&mut conn)
             .await?;
 
         Ok(PublishedMessage {

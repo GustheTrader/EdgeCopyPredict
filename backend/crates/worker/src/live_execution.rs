@@ -2,13 +2,16 @@ use anyhow::{bail, Context, Result};
 use arbitek_config::AppConfig;
 use arbitek_db::{
     connect_execution_worker as connect, AlertRepository, CopyIntentForExecution,
-    CopyIntentRepository, DbPool, OrderRepository, SystemSettingsRepository,
+    CopyIntentRepository, DbPool, FollowerRepository, OrderRepository, PositionRepository,
+    SystemSettingsRepository,
 };
+use arbitek_domain::copy_config::CopyConfig;
 use arbitek_domain::market_mapping::{default_binary_mappings, MarketMapper};
 use arbitek_execution::live::{execute_kalshi, execute_polymarket_clob, LiveExecutionInput};
 use arbitek_platform_kalshi::execution::KalshiExecutionClient;
 use arbitek_platform_kalshi::KalshiAuth;
 use arbitek_platform_polymarket::clob::PolymarketClobClient;
+use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -44,6 +47,8 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
 
     let copy_repo = CopyIntentRepository::new(pool.clone());
     let order_repo = OrderRepository::new(pool.clone());
+    let position_repo = PositionRepository::new(pool.clone());
+    let follower_repo = FollowerRepository::new(pool.clone());
     let intents = copy_repo
         .list_approved_for_execution(config.worker.execution_batch_size)
         .await?;
@@ -92,12 +97,59 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
             }
         }
 
+        if intent_is_stale(intent.created_at, config.worker.max_trade_age_seconds) {
+            warn!(
+                intent_id = %intent.id,
+                created_at = %intent.created_at,
+                max_age_seconds = config.worker.max_trade_age_seconds,
+                "skipping stale copy intent before live execution"
+            );
+            copy_repo.update_status(intent.id, "rejected").await?;
+            continue;
+        }
+
+        // Load the follower's copy config for slippage tolerance.
+        let cfg = match follower_repo.get_by_id(intent.follower_account_id).await {
+            Ok(Some(f)) => CopyConfig::from_value(&f.risk_config),
+            _ => CopyConfig::default(),
+        };
+
+        // Clamp sells to the follower's actual holding so a master exit never tries to
+        // sell more than the follower owns (which the exchange would reject anyway).
+        let mut input = live_input_from_intent(intent, cfg.slippage_fraction());
+        if intent.action == "sell" {
+            let market_id = arbitek_domain::stable_market_id(
+                intent.market_id,
+                &intent.signal_platform_market_id,
+            );
+            let held = position_repo
+                .open_contracts(intent.follower_account_id, market_id, &intent.outcome)
+                .await?;
+            match arbitek_domain::clamp_sell_to_held(intent.target_contracts, held) {
+                Some(c) => {
+                    if c < intent.target_contracts {
+                        warn!(
+                            intent_id = %intent.id,
+                            requested = %intent.target_contracts,
+                            held = %held,
+                            "clamping live sell to held contracts — master sold more than follower holds"
+                        );
+                    }
+                    input.target_contracts = c;
+                }
+                None => {
+                    info!(intent_id = %intent.id, "live sell intent with no open position to close — marking executed (already flat)");
+                    copy_repo.update_status(intent.id, "executed").await?;
+                    continue;
+                }
+            }
+        }
+
         let result = match intent.platform.as_str() {
             "kalshi" => {
                 if let Some(entry) =
                     mapper.kalshi_ticker_for_poly_condition(&intent.signal_platform_market_id)
                 {
-                    let input = live_input_from_intent(intent);
                     execute_kalshi(
                         &input,
                         kalshi_client
@@ -114,7 +166,6 @@ async fn run_live_execution_pass(config: &AppConfig, pool: &DbPool) -> Result<()
                 }
             }
             "polymarket" => {
-                let input = live_input_from_intent(intent);
                 let token_id = &intent.signal_platform_market_id;
                 execute_polymarket_clob(&input, &poly_clob_client, token_id).await
             }
@@ -196,7 +247,10 @@ fn build_polymarket_clob_client(config: &AppConfig) -> PolymarketClobClient {
     client
 }
 
-fn live_input_from_intent(intent: &CopyIntentForExecution) -> LiveExecutionInput {
+fn live_input_from_intent(
+    intent: &CopyIntentForExecution,
+    slippage: rust_decimal::Decimal,
+) -> LiveExecutionInput {
     LiveExecutionInput {
         order_id: Uuid::new_v4(),
         copy_intent_id: intent.id,
@@ -207,8 +261,14 @@ fn live_input_from_intent(intent: &CopyIntentForExecution) -> LiveExecutionInput
         side: intent.action.clone(),
         target_contracts: intent.target_contracts,
         price_limit: intent.price_limit,
+        slippage,
         client_order_id: format!("live:{}", intent.id),
     }
+}
+
+fn intent_is_stale(created_at: OffsetDateTime, max_age_seconds: u64) -> bool {
+    let seconds = max_age_seconds.min(i64::MAX as u64) as i64;
+    created_at < OffsetDateTime::now_utc() - Duration::seconds(seconds)
 }
 
 #[cfg(test)]
@@ -231,6 +291,7 @@ mod tests {
                 execution_batch_size: 10,
                 polymarket_poll_interval_seconds: 10,
                 kalshi_poll_interval_seconds: 10,
+                max_trade_age_seconds: 300,
             },
             polymarket: PolymarketConfig {
                 data_api_base_url: "https://api.test".to_owned(),
@@ -462,7 +523,7 @@ mod tests {
             market_title: None,
         };
 
-        let input = live_input_from_intent(&intent);
+        let input = live_input_from_intent(&intent, Decimal::new(1, 1));
 
         assert_eq!(input.copy_intent_id, intent.id);
         assert_eq!(input.follower_account_id, intent.follower_account_id);
